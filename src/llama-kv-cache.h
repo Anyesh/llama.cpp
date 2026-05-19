@@ -150,6 +150,19 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     //
+    // EVOKE block save/load: serialize a contiguous position span of one sequence and
+    // restore it at a new position without a forward-pass recompute (RoPE re-anchored).
+    //
+
+    // serialize the K/V of cells of seq_id whose pos is in [p0, p1) into io
+    void block_write(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
+    // load a buffer produced by block_write into seq_id starting at new_p0
+    // clears only [new_p0, new_p0 + n_cells) of seq_id (not the whole sequence)
+    // returns false on failure; the caller must apply the pending RoPE shift afterwards
+    bool block_read(llama_io_read_i & io, llama_seq_id seq_id, llama_pos new_p0);
+
+    //
     // llama_kv_cache specific API
     //
 

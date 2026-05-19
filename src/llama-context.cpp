@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -4014,6 +4016,96 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+// EVOKE: reach the concrete unified llama_kv_cache backing a context.
+// for an iSWA model the non-SWA ("base") cache is returned. returns nullptr if the
+// context is not backed by a plain attention KV cache (e.g. a recurrent/Mamba memory).
+static llama_kv_cache * llama_get_kv_cache(llama_context * ctx) {
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return nullptr;
+    }
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv;
+    }
+
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        return kv_iswa->get_base();
+    }
+
+    return nullptr;
+}
+
+size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t cap) {
+    ctx->synchronize();
+
+    llama_kv_cache * kv = llama_get_kv_cache(ctx);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: context is not backed by an attention KV cache\n", __func__);
+        return 0;
+    }
+
+    // first pass: measure the exact buffer size required for this block
+    size_t required = 0;
+    try {
+        llama_io_write_dummy io(false);
+        kv->block_write(io, seq_id, p0, p1);
+        required = io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error measuring kv block: %s\n", __func__, err.what());
+        return 0;
+    }
+
+    // size query, or the caller's buffer is too small: report the required size
+    if (dst == nullptr || cap < required) {
+        return required;
+    }
+
+    // second pass: actually serialize into the caller's buffer
+    try {
+        llama_io_write_host io(dst, cap);
+        kv->block_write(io, seq_id, p0, p1);
+        return io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving kv block: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+bool llama_kv_block_load(llama_context * ctx, llama_seq_id seq_id, const uint8_t * src, size_t size, llama_pos new_p0) {
+    ctx->synchronize();
+
+    if (src == nullptr) {
+        LLAMA_LOG_ERROR("%s: null source buffer\n", __func__);
+        return false;
+    }
+
+    llama_kv_cache * kv = llama_get_kv_cache(ctx);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: context is not backed by an attention KV cache\n", __func__);
+        return false;
+    }
+
+    bool ok = false;
+    try {
+        llama_io_read_host io(src, size);
+        ok = kv->block_read(io, seq_id, new_p0);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading kv block: %s\n", __func__, err.what());
+        return false;
+    }
+
+    if (!ok) {
+        return false;
+    }
+
+    // block_read queued a per-cell RoPE shift (new_pos - original_pos). apply it now via
+    // the deferred K-shift graph so K is re-anchored to the new positions before any decode.
+    ctx->memory_update(false);
+
+    return true;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

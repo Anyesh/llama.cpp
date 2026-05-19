@@ -2630,3 +2630,182 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
+
+//
+// EVOKE block save/load
+//
+
+void llama_kv_cache::block_write(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    const auto & cells = v_cells[strm];
+
+    cell_ranges_t cr { strm, {} };
+
+    uint32_t cell_count = 0;
+
+    // collect contiguous ranges of cells that belong to seq_id and whose pos is in [p0, p1)
+    uint32_t cell_range_begin = cells.size();
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, p0, p1)) {
+            ++cell_count;
+            if (cell_range_begin == cells.size()) {
+                cell_range_begin = i;
+            }
+        } else {
+            if (cell_range_begin != cells.size()) {
+                cr.data.emplace_back(cell_range_begin, i);
+                cell_range_begin = cells.size();
+            }
+        }
+    }
+
+    if (cell_range_begin != cells.size()) {
+        cr.data.emplace_back(cell_range_begin, cells.size());
+    }
+
+    uint32_t cell_count_check = 0;
+    for (const auto & range : cr.data) {
+        cell_count_check += range.second - range.first;
+    }
+    GGML_ASSERT(cell_count == cell_count_check);
+
+    io.write(&cell_count, sizeof(cell_count));
+
+    if (cell_count == 0) {
+        return;
+    }
+
+    // state_write_meta records each cell's original pos, which block_read needs to
+    // compute the per-cell RoPE shift = new_pos - original_pos
+    state_write_meta(io, cr, seq_id);
+    state_write_data(io, cr);
+}
+
+bool llama_kv_cache::block_read(llama_io_read_i & io, llama_seq_id seq_id, llama_pos new_p0) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (new_p0 < 0) {
+        LLAMA_LOG_ERROR("%s: invalid new_p0 = %d\n", __func__, new_p0);
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    auto & cells = v_cells[strm];
+    auto & head  = v_heads[strm];
+
+    uint32_t cell_count;
+    io.read(&cell_count, sizeof(cell_count));
+
+    if (cell_count == 0) {
+        return true;
+    }
+
+    if (cell_count > cells.size()) {
+        LLAMA_LOG_ERROR("%s: not enough cells in kv cache (%u > %u)\n", __func__, cell_count, cells.size());
+        return false;
+    }
+
+    // read the per-cell metadata (original positions) without mutating the cache yet
+    std::vector<llama_pos> pos_org(cell_count);
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        llama_pos pos;
+        uint32_t  n_seq_id;
+
+        io.read(&pos,      sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+
+        if (n_seq_id != 1) {
+            LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+            return false;
+        }
+
+        if (hparams.n_pos_per_embd() > 1) {
+            llama_kv_cell_ext ext;
+            io.read(&ext, sizeof(ext));
+        }
+
+        // the stored seq id is discarded - the block is restored into seq_id
+        {
+            llama_seq_id seq_id_src;
+            io.read(&seq_id_src, sizeof(seq_id_src));
+        }
+
+        pos_org[i] = pos;
+    }
+
+    // clear ONLY the target range of the destination sequence, not the whole sequence
+    seq_rm(seq_id, new_p0, new_p0 + (llama_pos) cell_count);
+
+    // find a slot for the block. positions do not affect placement for a non-SWA cache;
+    // find_slot only consults positions for SWA masking
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+
+    llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        ubatch.pos[i]      = new_p0 + (llama_pos) i;
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &seq_id;
+    }
+
+    slot_info sinfo = find_slot(ubatch, false);
+    if (sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
+        return false;
+    }
+
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    GGML_ASSERT(sinfo.idxs[0].size() == cell_count);
+
+    // place the cells at their ORIGINAL positions first, so that pos_add below produces
+    // both the correct new pos and the matching RoPE shift in a single accumulation step
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        const uint32_t idx = sinfo.idxs[0][i];
+
+        GGML_ASSERT(cells.is_empty(idx));
+
+        cells.pos_set(idx, pos_org[i]);
+        cells.seq_add(idx, seq_id);
+    }
+
+    // load the K/V tensor data into the found cells (handles GQA, v_trans and quantized K)
+    if (!state_read_data(io, strm, cell_count, sinfo)) {
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            cells.rm(sinfo.idxs[0][i]);
+        }
+        return false;
+    }
+
+    // re-anchor RoPE: shift each cell from its original pos to its new pos.
+    // pos_add accumulates shift[idx] += d and sets has_shift, so the deferred K-shift
+    // graph (build_graph_shift) will rotate K to the new positions. V is never rotated.
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        const uint32_t idx = sinfo.idxs[0][i];
+
+        const llama_pos d = (new_p0 + (llama_pos) i) - pos_org[i];
+
+        if (d != 0) {
+            cells.pos_add(idx, d);
+        }
+    }
+
+    head = sinfo.idxs[0].back() + 1;
+
+    return true;
+}
