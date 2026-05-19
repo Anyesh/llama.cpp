@@ -899,6 +899,33 @@ extern "C" {
            llama_state_seq_flags   flags);
 
     //
+    // EVOKE: recompute-free KV-cache block save/recover
+    //
+
+    // Serialize the K/V of the cells of seq_id whose position is in [p0, p1) into dst.
+    // Returns the number of bytes written. If dst is NULL or cap is smaller than the
+    // required size, nothing is written and the required buffer size is returned instead.
+    // This operation is non-destructive: the KV cache is left unchanged.
+    LLAMA_API size_t llama_kv_block_save(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                         uint8_t * dst,
+                          size_t   cap);
+
+    // Load a buffer produced by llama_kv_block_save into seq_id starting at new_p0.
+    // Only the range [new_p0, new_p0 + n_cells) of seq_id is cleared first (the rest of
+    // the sequence is left intact). K is re-anchored via RoPE so that it is correct for
+    // the new positions; no forward pass is performed. Returns true on success.
+    LLAMA_API bool llama_kv_block_load(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                   const uint8_t * src,
+                          size_t   size,
+                       llama_pos   new_p0);
+
+    //
     // Decoding
     //
 
