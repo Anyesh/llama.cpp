@@ -932,6 +932,27 @@ extern "C" {
                           size_t   size,
                        llama_pos   new_p0);
 
+    // Attention-only seq_rm: equivalent to llama_memory_seq_rm but reaches the
+    // attention KV cache directly, bypassing the recurrent half of hybrid memories.
+    // The recurrent half rejects partial tail rollback and would otherwise abort
+    // the whole operation, leaving the caller's position bookkeeping inconsistent
+    // with the actual cache state. Returns true if the call reached an attention
+    // cache; false if the context has no attention KV cache (pure-SSM model).
+    LLAMA_API bool llama_kv_block_seq_rm(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1);
+
+    // Attention-only seq_add: shift positions of cells in [p0, p1) by `shift`.
+    // Same hybrid-bypass rationale as llama_kv_block_seq_rm.
+    LLAMA_API void llama_kv_block_seq_add(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                       llama_pos   shift);
+
     //
     // Decoding
     //

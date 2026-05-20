@@ -4051,6 +4051,30 @@ static llama_kv_cache * llama_get_kv_cache(llama_context * ctx) {
     return nullptr;
 }
 
+// EVOKE: attention-only seq_rm. The top-level llama_memory_seq_rm on a hybrid
+// memory dispatches to the recurrent half first, which refuses partial tail
+// rollback (a Mamba state cannot be sliced), and on failure leaves both
+// sub-memories untouched while the caller assumes success. EVOKE wants to
+// shrink the attention KV cache without touching the recurrent state, so we
+// reach the attention sub-cache directly via llama_get_kv_cache.
+bool llama_kv_block_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    ctx->synchronize();
+    llama_kv_cache * kv = llama_get_kv_cache(ctx);
+    if (!kv) {
+        return false;
+    }
+    return kv->seq_rm(seq_id, p0, p1);
+}
+
+void llama_kv_block_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    ctx->synchronize();
+    llama_kv_cache * kv = llama_get_kv_cache(ctx);
+    if (!kv) {
+        return;
+    }
+    kv->seq_add(seq_id, p0, p1, shift);
+}
+
 size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t cap) {
     ctx->synchronize();
 
