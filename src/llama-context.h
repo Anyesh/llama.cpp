@@ -387,4 +387,29 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // EVOKE attention capture state. Configured at runtime via the
+    // llama_attn_capture_* C API; populated after each successful
+    // llama_decode when cparams.attn_capture_layer >= 0.
+public:
+    void attn_capture_set_layer(int32_t layer);
+    void attn_capture_set_buffer(float * dst, size_t cap_floats);
+    void attn_capture_get_dims(int32_t * n_query_tokens, int32_t * n_heads, int32_t * n_kv) const;
+    size_t attn_capture_get_written() const;
+    // Called by graph_get_cb's lambda when a tensor named "evoke_attn_capture"
+    // is added to the graph. Stores the pointer so post-compute readback knows
+    // which tensor to ggml_backend_tensor_get from.
+    void attn_capture_record_tensor(ggml_tensor * t);
+    // Called from process_ubatch after graph_compute succeeds. Copies the
+    // recorded tensor's data into the host buffer if configured.
+    void attn_capture_finalize();
+
+private:
+    float *       attn_capture_buf      = nullptr;
+    size_t        attn_capture_cap      = 0;
+    int32_t       attn_capture_n_query  = 0;
+    int32_t       attn_capture_n_heads  = 0;
+    int32_t       attn_capture_n_kv     = 0;
+    size_t        attn_capture_written  = 0;
+    ggml_tensor * attn_capture_tensor   = nullptr;
 };
