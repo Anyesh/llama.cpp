@@ -1304,6 +1304,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // EVOKE: if the graph included an evoke_attn_capture tensor (because
+    // cparams.attn_capture_layer matched a layer during build_attn_mha),
+    // copy its data into the caller-supplied host buffer now that compute
+    // has finished.
+    attn_capture_finalize();
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2330,6 +2336,15 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // EVOKE attention capture: build_attn_mha emits the side-compute
+        // softmax tensor under this name when cparams.attn_capture_layer
+        // matches the current layer. Record the tensor pointer so
+        // attn_capture_finalize() (called after graph_compute) knows which
+        // tensor to read back into the host buffer.
+        if (strcmp(name, "evoke_attn_capture") == 0) {
+            const_cast<llama_context *>(this)->attn_capture_record_tensor(cur);
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -3931,6 +3946,99 @@ void llama_kv_block_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos 
         return;
     }
     kv->seq_add(seq_id, p0, p1, shift);
+}
+
+//
+// EVOKE attention-weight capture
+//
+
+void llama_context::attn_capture_set_layer(int32_t layer) {
+    cparams.attn_capture_layer = layer;
+    // Invalidate any reused graph: the side-compute path is conditional on
+    // the layer matching, so a graph built when capture was off cannot be
+    // reused when capture is on (and vice versa). Clearing the graph
+    // result forces the next decode to build a fresh graph from current
+    // cparams.attn_capture_layer.
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+void llama_context::attn_capture_set_buffer(float * dst, size_t cap_floats) {
+    attn_capture_buf = dst;
+    attn_capture_cap = cap_floats;
+    attn_capture_written = 0;
+}
+
+void llama_context::attn_capture_get_dims(int32_t * n_query_tokens, int32_t * n_heads, int32_t * n_kv) const {
+    if (n_query_tokens) *n_query_tokens = attn_capture_n_query;
+    if (n_heads)        *n_heads        = attn_capture_n_heads;
+    if (n_kv)           *n_kv           = attn_capture_n_kv;
+}
+
+size_t llama_context::attn_capture_get_written() const {
+    return attn_capture_written;
+}
+
+void llama_context::attn_capture_record_tensor(ggml_tensor * t) {
+    attn_capture_tensor = t;
+}
+
+void llama_context::attn_capture_finalize() {
+    // No-op if capture isn't configured or the graph didn't include a
+    // capture tensor (e.g. graph build skipped the side compute because
+    // the model build path doesn't route through build_attn_mha — pure-SSM
+    // or models with custom attention paths).
+    if (attn_capture_tensor == nullptr || attn_capture_buf == nullptr || attn_capture_cap == 0) {
+        attn_capture_n_query = 0;
+        attn_capture_n_heads = 0;
+        attn_capture_n_kv    = 0;
+        attn_capture_written = 0;
+        attn_capture_tensor  = nullptr;
+        return;
+    }
+    // Captured tensor shape: ne[0] = n_kv, ne[1] = n_query_tokens, ne[2] = n_heads
+    // (same as ggml_soft_max_ext's input/output in the non-FA attention path).
+    const int64_t n_kv    = attn_capture_tensor->ne[0];
+    const int64_t n_query = attn_capture_tensor->ne[1];
+    const int64_t n_heads = attn_capture_tensor->ne[2];
+    const size_t  needed  = (size_t) n_kv * (size_t) n_query * (size_t) n_heads;
+    if (needed > attn_capture_cap) {
+        // Buffer too small: report dims so caller can resize, but don't write
+        // a partial result that could be misinterpreted as complete.
+        attn_capture_n_query = (int32_t) n_query;
+        attn_capture_n_heads = (int32_t) n_heads;
+        attn_capture_n_kv    = (int32_t) n_kv;
+        attn_capture_written = 0;
+        attn_capture_tensor  = nullptr;
+        return;
+    }
+    ggml_backend_tensor_get(attn_capture_tensor, attn_capture_buf, 0, needed * sizeof(float));
+    attn_capture_n_query = (int32_t) n_query;
+    attn_capture_n_heads = (int32_t) n_heads;
+    attn_capture_n_kv    = (int32_t) n_kv;
+    attn_capture_written = needed;
+    attn_capture_tensor  = nullptr;
+}
+
+void llama_attn_capture_set_layer(llama_context * ctx, int32_t layer) {
+    ctx->attn_capture_set_layer(layer);
+}
+
+void llama_attn_capture_set_buffer(llama_context * ctx, float * dst, size_t cap_floats) {
+    ctx->attn_capture_set_buffer(dst, cap_floats);
+}
+
+void llama_attn_capture_get_dims(
+        const llama_context * ctx,
+        int32_t             * n_query_tokens,
+        int32_t             * n_heads,
+        int32_t             * n_kv) {
+    ctx->attn_capture_get_dims(n_query_tokens, n_heads, n_kv);
+}
+
+size_t llama_attn_capture_get_written(const llama_context * ctx) {
+    return ctx->attn_capture_get_written();
 }
 
 size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t cap) {

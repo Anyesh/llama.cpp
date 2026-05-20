@@ -48,4 +48,12 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // EVOKE attention capture: which layer's per-head softmax attention
+    // weights to capture for the current decode. -1 = disabled. Runtime
+    // configurable via llama_attn_capture_set_layer; not part of the public
+    // init params. When enabled, build_attn_mha adds a parallel
+    // Q*K^T+softmax side compute for the matching layer whose output is
+    // copied to a host buffer after llama_decode.
+    int32_t attn_capture_layer = -1;
 };

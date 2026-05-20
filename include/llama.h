@@ -947,6 +947,55 @@ extern "C" {
                        llama_pos   shift);
 
     //
+    // EVOKE: attention-weight capture for relevance scoring
+    //
+    // Captures per-head softmax attention weights from one chosen layer into a
+    // caller-owned host buffer, once per llama_decode call. EVOKE's relevance
+    // scorer uses this as the model's actual vote on which past tokens are
+    // still relevant. The capture is a parallel side-compute (a second Q*K^T
+    // softmax over the same Q and K tensors used by the main attention layer);
+    // it does not affect the model's forward pass, only adds a small amount of
+    // extra compute proportional to one layer's attention.
+    //
+    // Workflow:
+    //   llama_attn_capture_set_layer(ctx, <layer_index>);
+    //   llama_attn_capture_set_buffer(ctx, dst, cap_floats);
+    //   llama_decode(ctx, batch);
+    //   llama_attn_capture_get_dims(ctx, &n_query, &n_heads, &n_kv);
+    //   // dst[0..n_query*n_heads*n_kv) now holds f32 attention weights.
+
+    // Set which layer's attention weights to capture on subsequent decodes.
+    // Pass -1 to disable. Default: -1 (disabled).
+    LLAMA_API void llama_attn_capture_set_layer(
+            struct llama_context * ctx,
+                         int32_t   layer);
+
+    // Set the host buffer where captured attention weights are written after
+    // each llama_decode. Buffer is caller-owned; capacity is in f32 elements
+    // (NOT bytes). Pass dst=NULL to detach.
+    LLAMA_API void llama_attn_capture_set_buffer(
+            struct llama_context * ctx,
+                          float * dst,
+                          size_t   cap_floats);
+
+    // Read the shape of the last capture. After a successful llama_decode the
+    // tracked layer produces an [n_query_tokens, n_heads, n_kv] f32 grid. If
+    // capture was disabled or no decode has happened since enabling it, all
+    // three return 0.
+    LLAMA_API void llama_attn_capture_get_dims(
+            const struct llama_context * ctx,
+                                int32_t * n_query_tokens,
+                                int32_t * n_heads,
+                                int32_t * n_kv);
+
+    // Number of f32 elements actually written into the host buffer by the
+    // most recent llama_decode. Returns 0 if capture was disabled, the buffer
+    // is unset, or the buffer was too small (in which case nothing is written
+    // and the caller can size up via _get_dims).
+    LLAMA_API size_t llama_attn_capture_get_written(
+            const struct llama_context * ctx);
+
+    //
     // Decoding
     //
 
