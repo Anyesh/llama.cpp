@@ -4069,6 +4069,25 @@ static llama_kv_cache * llama_get_kv_cache(llama_context * ctx) {
     return nullptr;
 }
 
+// returns the SWA sub-cache for iSWA models, nullptr otherwise. iSWA models
+// (Gemma 3/4) interleave global-attention and sliding-window-attention
+// layers; both have their own KV cache. block save/load needs to operate
+// on both halves to faithfully reconstruct the cells for layers that use
+// each attention type.
+static llama_kv_cache * llama_get_kv_cache_swa(llama_context * ctx) {
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return nullptr;
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        return kv_iswa->get_swa();
+    }
+    if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hyb_iswa->get_mem_attn()->get_swa();
+    }
+    return nullptr;
+}
+
 // EVOKE: attention-only seq_rm. The top-level llama_memory_seq_rm on a hybrid
 // memory dispatches to the recurrent half first, which refuses partial tail
 // rollback (a Mamba state cannot be sliced), and on failure leaves both
@@ -4249,13 +4268,21 @@ size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p
         LLAMA_LOG_ERROR("%s: context is not backed by an attention KV cache\n", __func__);
         return 0;
     }
+    llama_kv_cache * kv_swa = llama_get_kv_cache_swa(ctx);
 
-    // first pass: measure the exact buffer size required for this block
+    // first pass: measure the exact buffer size required for this block.
+    // iSWA models pay an extra 4 bytes for the swa_size header in addition
+    // to the actual SWA cell bytes.
     size_t required = 0;
     try {
         llama_io_write_dummy io(false);
         kv->block_write(io, seq_id, p0, p1);
         required = io.n_bytes();
+        if (kv_swa) {
+            llama_io_write_dummy io_swa(false);
+            kv_swa->block_write(io_swa, seq_id, p0, p1);
+            required += sizeof(uint32_t) + io_swa.n_bytes();
+        }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error measuring kv block: %s\n", __func__, err.what());
         return 0;
@@ -4266,11 +4293,26 @@ size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p
         return required;
     }
 
-    // second pass: actually serialize into the caller's buffer
+    // second pass: actually serialize into the caller's buffer. Layout for
+    // non-iSWA: base block_write bytes only. Layout for iSWA: base bytes
+    // followed by [4-byte swa_size][swa bytes]. The 4-byte header lets the
+    // load path know how many SWA bytes follow without rerunning the
+    // measurement pass.
     try {
         llama_io_write_host io(dst, cap);
         kv->block_write(io, seq_id, p0, p1);
-        return io.n_bytes();
+        const size_t base_written = io.n_bytes();
+        if (kv_swa) {
+            // Measure swa bytes first so we can write the size header up
+            // front; this avoids a dance with patching the size after.
+            llama_io_write_dummy io_swa_meas(false);
+            kv_swa->block_write(io_swa_meas, seq_id, p0, p1);
+            const uint32_t swa_size = (uint32_t) io_swa_meas.n_bytes();
+            io.write(&swa_size, sizeof(uint32_t));
+            kv_swa->block_write(io, seq_id, p0, p1);
+            return base_written + sizeof(uint32_t) + (size_t) swa_size;
+        }
+        return base_written;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving kv block: %s\n", __func__, err.what());
         return 0;
@@ -4290,11 +4332,25 @@ bool llama_kv_block_load(llama_context * ctx, llama_seq_id seq_id, const uint8_t
         LLAMA_LOG_ERROR("%s: context is not backed by an attention KV cache\n", __func__);
         return false;
     }
+    llama_kv_cache * kv_swa = llama_get_kv_cache_swa(ctx);
 
     bool ok = false;
     try {
         llama_io_read_host io(src, size);
         ok = kv->block_read(io, seq_id, new_p0);
+        if (!ok) {
+            return false;
+        }
+        // iSWA models: the rest of the buffer is [4-byte swa_size][swa
+        // block_read bytes]. The base block_read consumed its own bytes
+        // off io; the swa section follows.
+        if (kv_swa) {
+            uint32_t swa_size = 0;
+            io.read(&swa_size, sizeof(uint32_t));
+            if (swa_size > 0) {
+                ok = kv_swa->block_read(io, seq_id, new_p0) && ok;
+            }
+        }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading kv block: %s\n", __func__, err.what());
         return false;
