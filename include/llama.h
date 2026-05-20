@@ -972,10 +972,22 @@ extern "C" {
     //   // dst[0..n_query*n_heads*n_kv) now holds f32 attention weights.
 
     // Set which layer's attention weights to capture on subsequent decodes.
-    // Pass -1 to disable. Default: -1 (disabled).
+    // Pass -1 to disable. Default: -1 (disabled). Convenience wrapper for
+    // capturing a single layer; equivalent to llama_attn_capture_set_layers
+    // with a one-element array.
     LLAMA_API void llama_attn_capture_set_layer(
             struct llama_context * ctx,
                          int32_t   layer);
+
+    // Set the list of layers to capture on subsequent decodes (max 16).
+    // Captured layers are written into the host buffer in the order given,
+    // producing a [n_layers, n_query_tokens, n_heads, n_kv] f32 grid. Pass
+    // n_layers=0 to disable. The relevance scorer aggregates across layers
+    // (deeper layers carry stronger semantic signal) per block.
+    LLAMA_API void llama_attn_capture_set_layers(
+            struct llama_context * ctx,
+                   const int32_t * layers,
+                         int32_t   n_layers);
 
     // Set the host buffer where captured attention weights are written after
     // each llama_decode. Buffer is caller-owned; capacity is in f32 elements
@@ -986,11 +998,12 @@ extern "C" {
                           size_t   cap_floats);
 
     // Read the shape of the last capture. After a successful llama_decode the
-    // tracked layer produces an [n_query_tokens, n_heads, n_kv] f32 grid. If
-    // capture was disabled or no decode has happened since enabling it, all
-    // three return 0.
+    // tracked layers produce an [n_layers, n_query_tokens, n_heads, n_kv]
+    // f32 grid. If capture was disabled or no decode has happened since
+    // enabling it, all four return 0.
     LLAMA_API void llama_attn_capture_get_dims(
             const struct llama_context * ctx,
+                                int32_t * n_layers,
                                 int32_t * n_query_tokens,
                                 int32_t * n_heads,
                                 int32_t * n_kv);

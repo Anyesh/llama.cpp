@@ -18,6 +18,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -2466,12 +2467,14 @@ llm_graph_cb llama_context::graph_get_cb() const {
         }
 
         // EVOKE attention capture: build_attn_mha emits the side-compute
-        // softmax tensor under this name when cparams.attn_capture_layer
-        // matches the current layer. Record the tensor pointer so
-        // attn_capture_finalize() (called after graph_compute) knows which
-        // tensor to read back into the host buffer.
-        if (strcmp(name, "evoke_attn_capture") == 0) {
-            const_cast<llama_context *>(this)->attn_capture_record_tensor(cur);
+        // softmax tensor under "evoke_attn_capture_<slot_idx>" when this
+        // layer is in the configured capture set. Parse the slot index
+        // and record the tensor so attn_capture_finalize() (called after
+        // graph_compute) can read each captured layer back into the host
+        // buffer at the right offset.
+        if (strncmp(name, "evoke_attn_capture_", 19) == 0) {
+            int32_t idx = atoi(name + 19);
+            const_cast<llama_context *>(this)->attn_capture_record_tensor(idx, cur);
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -4096,11 +4099,26 @@ void llama_kv_block_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos 
 
 void llama_context::attn_capture_set_layer(int32_t layer) {
     cparams.attn_capture_layer = layer;
-    // Invalidate any reused graph: the side-compute path is conditional on
-    // the layer matching, so a graph built when capture was off cannot be
-    // reused when capture is on (and vice versa). Clearing the graph
-    // result forces the next decode to build a fresh graph from current
-    // cparams.attn_capture_layer.
+    // Clear any multi-layer list when a singular call lands, so the two
+    // configuration paths don't combine confusingly.
+    cparams.attn_capture_n_layers = 0;
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+void llama_context::attn_capture_set_layers(const int32_t * layers, int32_t n_layers) {
+    if (n_layers < 0) {
+        n_layers = 0;
+    }
+    if (n_layers > llama_cparams::ATTN_CAPTURE_MAX_LAYERS) {
+        n_layers = llama_cparams::ATTN_CAPTURE_MAX_LAYERS;
+    }
+    cparams.attn_capture_layer = -1;
+    cparams.attn_capture_n_layers = n_layers;
+    for (int32_t i = 0; i < n_layers; ++i) {
+        cparams.attn_capture_layers[i] = layers[i];
+    }
     if (gf_res_prev) {
         gf_res_prev->reset();
     }
@@ -4112,7 +4130,8 @@ void llama_context::attn_capture_set_buffer(float * dst, size_t cap_floats) {
     attn_capture_written = 0;
 }
 
-void llama_context::attn_capture_get_dims(int32_t * n_query_tokens, int32_t * n_heads, int32_t * n_kv) const {
+void llama_context::attn_capture_get_dims(int32_t * n_layers, int32_t * n_query_tokens, int32_t * n_heads, int32_t * n_kv) const {
+    if (n_layers)       *n_layers       = attn_capture_n_layers;
     if (n_query_tokens) *n_query_tokens = attn_capture_n_query;
     if (n_heads)        *n_heads        = attn_capture_n_heads;
     if (n_kv)           *n_kv           = attn_capture_n_kv;
@@ -4122,49 +4141,87 @@ size_t llama_context::attn_capture_get_written() const {
     return attn_capture_written;
 }
 
-void llama_context::attn_capture_record_tensor(ggml_tensor * t) {
-    attn_capture_tensor = t;
+void llama_context::attn_capture_record_tensor(int32_t idx, ggml_tensor * t) {
+    if (idx < 0 || idx >= ATTN_CAPTURE_MAX_SLOTS) {
+        return;
+    }
+    attn_capture_tensors[idx] = t;
 }
 
 void llama_context::attn_capture_finalize() {
-    // No-op if capture isn't configured or the graph didn't include a
-    // capture tensor (e.g. graph build skipped the side compute because
-    // the model build path doesn't route through build_attn_mha — pure-SSM
-    // or models with custom attention paths).
-    if (attn_capture_tensor == nullptr || attn_capture_buf == nullptr || attn_capture_cap == 0) {
-        attn_capture_n_query = 0;
-        attn_capture_n_heads = 0;
-        attn_capture_n_kv    = 0;
-        attn_capture_written = 0;
-        attn_capture_tensor  = nullptr;
+    // Configured slot count: singular set_layer counts as one, multi-layer
+    // set_layers reports its own n_layers, both disabled -> zero slots.
+    int32_t n_slots = 0;
+    if (cparams.attn_capture_n_layers > 0) {
+        n_slots = cparams.attn_capture_n_layers;
+    } else if (cparams.attn_capture_layer >= 0) {
+        n_slots = 1;
+    }
+    if (n_slots == 0 || attn_capture_buf == nullptr || attn_capture_cap == 0) {
+        attn_capture_n_layers = 0;
+        attn_capture_n_query  = 0;
+        attn_capture_n_heads  = 0;
+        attn_capture_n_kv     = 0;
+        attn_capture_written  = 0;
+        for (int32_t i = 0; i < ATTN_CAPTURE_MAX_SLOTS; ++i) {
+            attn_capture_tensors[i] = nullptr;
+        }
         return;
     }
-    // Captured tensor shape: ne[0] = n_kv, ne[1] = n_query_tokens, ne[2] = n_heads
-    // (same as ggml_soft_max_ext's input/output in the non-FA attention path).
-    const int64_t n_kv    = attn_capture_tensor->ne[0];
-    const int64_t n_query = attn_capture_tensor->ne[1];
-    const int64_t n_heads = attn_capture_tensor->ne[2];
-    const size_t  needed  = (size_t) n_kv * (size_t) n_query * (size_t) n_heads;
+    // Use the first recorded tensor's shape as the per-layer shape; all
+    // captured layers from one decode share n_kv / n_query / n_heads.
+    ggml_tensor * ref = nullptr;
+    for (int32_t i = 0; i < n_slots; ++i) {
+        if (attn_capture_tensors[i] != nullptr) { ref = attn_capture_tensors[i]; break; }
+    }
+    if (ref == nullptr) {
+        attn_capture_n_layers = 0;
+        attn_capture_n_query  = 0;
+        attn_capture_n_heads  = 0;
+        attn_capture_n_kv     = 0;
+        attn_capture_written  = 0;
+        return;
+    }
+    const int64_t n_kv    = ref->ne[0];
+    const int64_t n_query = ref->ne[1];
+    const int64_t n_heads = ref->ne[2];
+    const size_t  per_layer = (size_t) n_kv * (size_t) n_query * (size_t) n_heads;
+    const size_t  needed    = per_layer * (size_t) n_slots;
     if (needed > attn_capture_cap) {
-        // Buffer too small: report dims so caller can resize, but don't write
-        // a partial result that could be misinterpreted as complete.
-        attn_capture_n_query = (int32_t) n_query;
-        attn_capture_n_heads = (int32_t) n_heads;
-        attn_capture_n_kv    = (int32_t) n_kv;
-        attn_capture_written = 0;
-        attn_capture_tensor  = nullptr;
+        attn_capture_n_layers = (int32_t) n_slots;
+        attn_capture_n_query  = (int32_t) n_query;
+        attn_capture_n_heads  = (int32_t) n_heads;
+        attn_capture_n_kv     = (int32_t) n_kv;
+        attn_capture_written  = 0;
+        for (int32_t i = 0; i < ATTN_CAPTURE_MAX_SLOTS; ++i) {
+            attn_capture_tensors[i] = nullptr;
+        }
         return;
     }
-    ggml_backend_tensor_get(attn_capture_tensor, attn_capture_buf, 0, needed * sizeof(float));
-    attn_capture_n_query = (int32_t) n_query;
-    attn_capture_n_heads = (int32_t) n_heads;
-    attn_capture_n_kv    = (int32_t) n_kv;
-    attn_capture_written = needed;
-    attn_capture_tensor  = nullptr;
+    for (int32_t i = 0; i < n_slots; ++i) {
+        ggml_tensor * t = attn_capture_tensors[i];
+        if (t == nullptr) {
+            // Layer wasn't visited (model build path didn't reach it). Zero
+            // the slot so downstream aggregation doesn't see garbage.
+            memset(attn_capture_buf + (size_t) i * per_layer, 0, per_layer * sizeof(float));
+            continue;
+        }
+        ggml_backend_tensor_get(t, attn_capture_buf + (size_t) i * per_layer, 0, per_layer * sizeof(float));
+        attn_capture_tensors[i] = nullptr;
+    }
+    attn_capture_n_layers = (int32_t) n_slots;
+    attn_capture_n_query  = (int32_t) n_query;
+    attn_capture_n_heads  = (int32_t) n_heads;
+    attn_capture_n_kv     = (int32_t) n_kv;
+    attn_capture_written  = needed;
 }
 
 void llama_attn_capture_set_layer(llama_context * ctx, int32_t layer) {
     ctx->attn_capture_set_layer(layer);
+}
+
+void llama_attn_capture_set_layers(llama_context * ctx, const int32_t * layers, int32_t n_layers) {
+    ctx->attn_capture_set_layers(layers, n_layers);
 }
 
 void llama_attn_capture_set_buffer(llama_context * ctx, float * dst, size_t cap_floats) {
@@ -4173,10 +4230,11 @@ void llama_attn_capture_set_buffer(llama_context * ctx, float * dst, size_t cap_
 
 void llama_attn_capture_get_dims(
         const llama_context * ctx,
+        int32_t             * n_layers,
         int32_t             * n_query_tokens,
         int32_t             * n_heads,
         int32_t             * n_kv) {
-    ctx->attn_capture_get_dims(n_query_tokens, n_heads, n_kv);
+    ctx->attn_capture_get_dims(n_layers, n_query_tokens, n_heads, n_kv);
 }
 
 size_t llama_attn_capture_get_written(const llama_context * ctx) {
