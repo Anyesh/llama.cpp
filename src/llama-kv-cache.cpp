@@ -583,7 +583,10 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    // mrope cells store a single temporal pos plus a separate ext payload for the
+    // spatial axes. A seq_add shifts the temporal pos only, so single-axis pos_add
+    // is correct; the deferred K-shift graph rotates K via the mrope workaround in
+    // build_rope_shift (treats the temporal delta as a NeoX rotation).
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -1186,9 +1189,8 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
+    // mrope models are supported via build_rope_shift's NeoX workaround: the
+    // temporal-only shift in cells.shift[] is applied as a whole-vector rotation.
     return true;
 }
 
