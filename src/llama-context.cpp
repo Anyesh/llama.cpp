@@ -9,6 +9,8 @@
 #include "llama-memory.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3877,8 +3879,11 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
 }
 
 // EVOKE: reach the concrete unified llama_kv_cache backing a context.
-// for an iSWA model the non-SWA ("base") cache is returned. returns nullptr if the
-// context is not backed by a plain attention KV cache (e.g. a recurrent/Mamba memory).
+// for an iSWA model the non-SWA ("base") cache is returned. for hybrid
+// attention+recurrent models the attention sub-cache is returned so block
+// save/load operates on the attention layers; recurrent layers carry a
+// fixed-size state that does not need eviction or recovery. returns nullptr
+// if the context has no attention KV cache (a pure recurrent/Mamba memory).
 static llama_kv_cache * llama_get_kv_cache(llama_context * ctx) {
     llama_memory_t mem = ctx->get_memory();
     if (!mem) {
@@ -3891,6 +3896,14 @@ static llama_kv_cache * llama_get_kv_cache(llama_context * ctx) {
 
     if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
         return kv_iswa->get_base();
+    }
+
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_attn();
+    }
+
+    if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hyb_iswa->get_mem_attn()->get_base();
     }
 
     return nullptr;
