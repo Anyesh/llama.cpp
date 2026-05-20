@@ -13,6 +13,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1958,26 +1959,44 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
-    // EVOKE attention-weight capture: when cparams.attn_capture_layer matches
-    // this layer, build a parallel Q*K^T softmax compute alongside the main
-    // attention path. The capture's output is a side node whose data does
-    // not flow into the model's forward computation; after graph_compute
-    // returns, llama_context copies its data into a caller-owned host buffer
-    // for the relevance scorer. This is the price we pay for keeping FA on
-    // in the main path (FA fuses softmax inside the kernel and won't expose
+    // EVOKE attention-weight capture: when this layer is in the capture set
+    // (singular attn_capture_layer for legacy single-layer setup, OR any
+    // layer in the multi-layer attn_capture_layers[] array), build a
+    // parallel Q*K^T softmax compute alongside the main attention path.
+    // The capture's output is a side node whose data does not flow into
+    // the model's forward computation; after graph_compute returns,
+    // llama_context copies the data into a caller-owned host buffer for
+    // the relevance scorer. This is the price we pay for keeping FA on in
+    // the main path (FA fuses softmax inside the kernel and won't expose
     // attention weights to host).
     //
-    // ggml_build_forward_expand is mandatory: without it, the scheduler's
-    // dead-code elimination would drop the capture node because the model's
+    // ggml_build_forward_expand is mandatory: without it the scheduler's
+    // dead-code elimination would drop the capture node because the model
     // output never references it.
-    if (il == cparams.attn_capture_layer) {
+    bool should_capture = (il == cparams.attn_capture_layer);
+    int capture_idx = (il == cparams.attn_capture_layer) ? 0 : -1;
+    if (!should_capture) {
+        for (int32_t i = 0; i < cparams.attn_capture_n_layers; ++i) {
+            if (cparams.attn_capture_layers[i] == il) {
+                should_capture = true;
+                capture_idx = i;
+                break;
+            }
+        }
+    }
+    if (should_capture) {
         ggml_tensor * cap = ggml_mul_mat(ctx0, k, q);
         ggml_mul_mat_set_prec(cap, GGML_PREC_F32);
         cap = ggml_soft_max_ext(ctx0, cap, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         if (sinks) {
             ggml_soft_max_add_sinks(cap, sinks);
         }
-        cb(cap, "evoke_attn_capture", il);
+        // Naming the capture node "evoke_attn_capture_<index>" gives
+        // llama_context an unambiguous map from layer index in the
+        // configured list to tensor in the post-compute readback path.
+        char name[64];
+        snprintf(name, sizeof(name), "evoke_attn_capture_%d", capture_idx);
+        cb(cap, name, il);
         ggml_build_forward_expand(gf, cap);
     }
 

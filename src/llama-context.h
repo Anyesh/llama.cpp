@@ -380,23 +380,29 @@ private:
     // llama_decode when cparams.attn_capture_layer >= 0.
 public:
     void attn_capture_set_layer(int32_t layer);
+    void attn_capture_set_layers(const int32_t * layers, int32_t n_layers);
     void attn_capture_set_buffer(float * dst, size_t cap_floats);
-    void attn_capture_get_dims(int32_t * n_query_tokens, int32_t * n_heads, int32_t * n_kv) const;
+    void attn_capture_get_dims(int32_t * n_layers, int32_t * n_query_tokens, int32_t * n_heads, int32_t * n_kv) const;
     size_t attn_capture_get_written() const;
-    // Called by graph_get_cb's lambda when a tensor named "evoke_attn_capture"
-    // is added to the graph. Stores the pointer so post-compute readback knows
-    // which tensor to ggml_backend_tensor_get from.
-    void attn_capture_record_tensor(ggml_tensor * t);
-    // Called from process_ubatch after graph_compute succeeds. Copies the
-    // recorded tensor's data into the host buffer if configured.
+    // Called by graph_get_cb's lambda when a tensor named
+    // "evoke_attn_capture_<idx>" is added to the graph. Stores the
+    // pointer at slot idx so post-compute readback knows which tensors
+    // to ggml_backend_tensor_get from.
+    void attn_capture_record_tensor(int32_t idx, ggml_tensor * t);
+    // Called from process_ubatch after graph_compute succeeds. Copies all
+    // recorded tensors' data into the host buffer in [n_layers, n_query,
+    // n_heads, n_kv] layout.
     void attn_capture_finalize();
 
 private:
     float *       attn_capture_buf      = nullptr;
     size_t        attn_capture_cap      = 0;
+    int32_t       attn_capture_n_layers = 0;
     int32_t       attn_capture_n_query  = 0;
     int32_t       attn_capture_n_heads  = 0;
     int32_t       attn_capture_n_kv     = 0;
     size_t        attn_capture_written  = 0;
-    ggml_tensor * attn_capture_tensor   = nullptr;
+    // Indexed by capture_idx (matches cparams.attn_capture_layers ordering).
+    static constexpr int32_t ATTN_CAPTURE_MAX_SLOTS = 16;
+    ggml_tensor * attn_capture_tensors[ATTN_CAPTURE_MAX_SLOTS] = {nullptr};
 };
