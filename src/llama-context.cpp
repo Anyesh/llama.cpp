@@ -1378,6 +1378,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // copy its data into the caller-supplied host buffer now that compute
     // has finished.
     attn_capture_finalize();
+    query_capture_finalize();
+    key_capture_finalize();
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2475,6 +2477,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (strncmp(name, "evoke_attn_capture_", 19) == 0) {
             int32_t idx = atoi(name + 19);
             const_cast<llama_context *>(this)->attn_capture_record_tensor(idx, cur);
+        }
+
+        // EVOKE query/key capture: build_attn_mha emits the permuted q and k
+        // at the scoring layer under these names so query_capture_finalize /
+        // key_capture_finalize can read them back into their host buffers.
+        if (strncmp(name, "evoke_query_capture_", 20) == 0) {
+            const_cast<llama_context *>(this)->query_capture_record_tensor(cur);
+        }
+        if (strncmp(name, "evoke_key_capture_", 18) == 0) {
+            const_cast<llama_context *>(this)->key_capture_record_tensor(cur);
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -4258,6 +4270,130 @@ void llama_attn_capture_get_dims(
 
 size_t llama_attn_capture_get_written(const llama_context * ctx) {
     return ctx->attn_capture_get_written();
+}
+
+//
+// EVOKE query/key capture
+//
+
+void llama_context::query_capture_set_buffer(float * dst, size_t cap_floats) {
+    query_capture_buf = dst;
+    query_capture_cap = cap_floats;
+    query_capture_written = 0;
+}
+
+void llama_context::query_capture_get_dims(int32_t * ne0, int32_t * ne1, int32_t * ne2) const {
+    if (ne0) *ne0 = query_capture_d0;
+    if (ne1) *ne1 = query_capture_d1;
+    if (ne2) *ne2 = query_capture_d2;
+}
+
+size_t llama_context::query_capture_get_written() const {
+    return query_capture_written;
+}
+
+void llama_context::query_capture_record_tensor(ggml_tensor * t) {
+    query_capture_tensor = t;
+}
+
+void llama_context::query_capture_finalize() {
+    query_capture_d0 = 0;
+    query_capture_d1 = 0;
+    query_capture_d2 = 0;
+    query_capture_written = 0;
+    ggml_tensor * t = query_capture_tensor;
+    query_capture_tensor = nullptr;
+    if (t == nullptr || query_capture_buf == nullptr || query_capture_cap == 0) {
+        return;
+    }
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+    const int64_t ne2 = t->ne[2];
+    const size_t  needed = (size_t) ne0 * (size_t) ne1 * (size_t) ne2;
+    query_capture_d0 = (int32_t) ne0;
+    query_capture_d1 = (int32_t) ne1;
+    query_capture_d2 = (int32_t) ne2;
+    if (needed > query_capture_cap) {
+        return;
+    }
+    ggml_backend_tensor_get(t, query_capture_buf, 0, needed * sizeof(float));
+    query_capture_written = needed;
+}
+
+void llama_context::key_capture_set_buffer(float * dst, size_t cap_floats) {
+    key_capture_buf = dst;
+    key_capture_cap = cap_floats;
+    key_capture_written = 0;
+}
+
+void llama_context::key_capture_get_dims(int32_t * ne0, int32_t * ne1, int32_t * ne2) const {
+    if (ne0) *ne0 = key_capture_d0;
+    if (ne1) *ne1 = key_capture_d1;
+    if (ne2) *ne2 = key_capture_d2;
+}
+
+size_t llama_context::key_capture_get_written() const {
+    return key_capture_written;
+}
+
+void llama_context::key_capture_record_tensor(ggml_tensor * t) {
+    key_capture_tensor = t;
+}
+
+void llama_context::key_capture_finalize() {
+    key_capture_d0 = 0;
+    key_capture_d1 = 0;
+    key_capture_d2 = 0;
+    key_capture_written = 0;
+    ggml_tensor * t = key_capture_tensor;
+    key_capture_tensor = nullptr;
+    if (t == nullptr || key_capture_buf == nullptr || key_capture_cap == 0) {
+        return;
+    }
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+    const int64_t ne2 = t->ne[2];
+    const size_t  needed = (size_t) ne0 * (size_t) ne1 * (size_t) ne2;
+    key_capture_d0 = (int32_t) ne0;
+    key_capture_d1 = (int32_t) ne1;
+    key_capture_d2 = (int32_t) ne2;
+    if (needed > key_capture_cap) {
+        return;
+    }
+    ggml_backend_tensor_get(t, key_capture_buf, 0, needed * sizeof(float));
+    key_capture_written = needed;
+}
+
+void llama_query_capture_set_buffer(llama_context * ctx, float * dst, size_t cap_floats) {
+    ctx->query_capture_set_buffer(dst, cap_floats);
+}
+
+void llama_query_capture_get_dims(
+        const llama_context * ctx,
+        int32_t             * ne0,
+        int32_t             * ne1,
+        int32_t             * ne2) {
+    ctx->query_capture_get_dims(ne0, ne1, ne2);
+}
+
+size_t llama_query_capture_get_written(const llama_context * ctx) {
+    return ctx->query_capture_get_written();
+}
+
+void llama_key_capture_set_buffer(llama_context * ctx, float * dst, size_t cap_floats) {
+    ctx->key_capture_set_buffer(dst, cap_floats);
+}
+
+void llama_key_capture_get_dims(
+        const llama_context * ctx,
+        int32_t             * ne0,
+        int32_t             * ne1,
+        int32_t             * ne2) {
+    ctx->key_capture_get_dims(ne0, ne1, ne2);
+}
+
+size_t llama_key_capture_get_written(const llama_context * ctx) {
+    return ctx->key_capture_get_written();
 }
 
 size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t cap) {

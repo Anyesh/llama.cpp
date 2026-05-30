@@ -2129,6 +2129,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         snprintf(name, sizeof(name), "evoke_attn_capture_%d", capture_idx);
         cb(cap, name, il);
         ggml_build_forward_expand(gf, cap);
+
+        // EVOKE query/key capture for ArkVale-style scoring (q.cuboid
+        // importance over per-block key min/max). Capture the permuted q and
+        // k tensors as-is (no softmax) at the single scoring layer; index 0 is
+        // sufficient because only cparams.attn_capture_layer feeds the policy.
+        if (il == cparams.attn_capture_layer) {
+            ggml_tensor * qcap = ggml_cont(ctx0, q);
+            cb(qcap, "evoke_query_capture_0", il);
+            ggml_build_forward_expand(gf, qcap);
+
+            ggml_tensor * kcap = ggml_cont(ctx0, k);
+            cb(kcap, "evoke_key_capture_0", il);
+            ggml_build_forward_expand(gf, kcap);
+        }
     }
 
     ggml_tensor * cur;

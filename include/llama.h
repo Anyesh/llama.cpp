@@ -1016,6 +1016,44 @@ extern "C" {
             const struct llama_context * ctx);
 
     //
+    // EVOKE: query/key capture for ArkVale-style relevance scoring
+    //
+    // Mirrors the attention-weight capture above, but exposes the raw permuted
+    // query and key tensors at the single scoring layer (cparams.attn_capture
+    // _layer, when >= 0) instead of softmax weights. Each is written once per
+    // llama_decode into its own caller-owned host buffer, laid out as
+    // [head_dim, n_tokens, n_heads] f32 in ne0/ne1/ne2 order. The policy uses
+    // these to compute q.cuboid importance over per-block key min/max.
+
+    LLAMA_API void llama_query_capture_set_buffer(
+            struct llama_context * ctx,
+                          float * dst,
+                          size_t   cap_floats);
+
+    LLAMA_API void llama_query_capture_get_dims(
+            const struct llama_context * ctx,
+                                int32_t * ne0,
+                                int32_t * ne1,
+                                int32_t * ne2);
+
+    LLAMA_API size_t llama_query_capture_get_written(
+            const struct llama_context * ctx);
+
+    LLAMA_API void llama_key_capture_set_buffer(
+            struct llama_context * ctx,
+                          float * dst,
+                          size_t   cap_floats);
+
+    LLAMA_API void llama_key_capture_get_dims(
+            const struct llama_context * ctx,
+                                int32_t * ne0,
+                                int32_t * ne1,
+                                int32_t * ne2);
+
+    LLAMA_API size_t llama_key_capture_get_written(
+            const struct llama_context * ctx);
+
+    //
     // Decoding
     //
 

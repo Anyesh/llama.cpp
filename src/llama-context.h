@@ -407,6 +407,22 @@ public:
     // n_heads, n_kv] layout.
     void attn_capture_finalize();
 
+    // EVOKE query/key capture. Mirrors attn_capture but exposes the raw
+    // permuted q and k tensors at cparams.attn_capture_layer (single slot)
+    // for ArkVale-style scoring. Buffers hold [head_dim, n_tokens, n_heads]
+    // f32 in ne0/ne1/ne2 order.
+    void query_capture_set_buffer(float * dst, size_t cap_floats);
+    void query_capture_get_dims(int32_t * ne0, int32_t * ne1, int32_t * ne2) const;
+    size_t query_capture_get_written() const;
+    void query_capture_record_tensor(ggml_tensor * t);
+    void query_capture_finalize();
+
+    void key_capture_set_buffer(float * dst, size_t cap_floats);
+    void key_capture_get_dims(int32_t * ne0, int32_t * ne1, int32_t * ne2) const;
+    size_t key_capture_get_written() const;
+    void key_capture_record_tensor(ggml_tensor * t);
+    void key_capture_finalize();
+
 private:
     float *       attn_capture_buf      = nullptr;
     size_t        attn_capture_cap      = 0;
@@ -418,4 +434,20 @@ private:
     // Indexed by capture_idx (matches cparams.attn_capture_layers ordering).
     static constexpr int32_t ATTN_CAPTURE_MAX_SLOTS = 16;
     ggml_tensor * attn_capture_tensors[ATTN_CAPTURE_MAX_SLOTS] = {nullptr};
+
+    float *       query_capture_buf     = nullptr;
+    size_t        query_capture_cap     = 0;
+    int32_t       query_capture_d0      = 0;
+    int32_t       query_capture_d1      = 0;
+    int32_t       query_capture_d2      = 0;
+    size_t        query_capture_written = 0;
+    ggml_tensor * query_capture_tensor  = nullptr;
+
+    float *       key_capture_buf     = nullptr;
+    size_t        key_capture_cap     = 0;
+    int32_t       key_capture_d0      = 0;
+    int32_t       key_capture_d1      = 0;
+    int32_t       key_capture_d2      = 0;
+    size_t        key_capture_written = 0;
+    ggml_tensor * key_capture_tensor  = nullptr;
 };
