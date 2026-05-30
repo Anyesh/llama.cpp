@@ -2131,15 +2131,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_build_forward_expand(gf, cap);
 
         // EVOKE query/key capture for ArkVale-style scoring (q.cuboid
-        // importance over per-block key min/max). Capture the permuted q and
-        // k tensors as-is (no softmax) at the single scoring layer; index 0 is
-        // sufficient because only cparams.attn_capture_layer feeds the policy.
+        // importance over per-block key min/max). Cast the permuted q and k to
+        // F32 before capture: the cache K is stored F16 (or quantized), and the
+        // host readback in finalize reads sizeof(float) per element, so capturing
+        // the native-type tensor would overrun it. ggml_cast yields a contiguous
+        // F32 copy. Single scoring layer (index 0) is enough for the policy.
         if (il == cparams.attn_capture_layer) {
-            ggml_tensor * qcap = ggml_cont(ctx0, q);
+            ggml_tensor * qcap = ggml_cast(ctx0, q, GGML_TYPE_F32);
             cb(qcap, "evoke_query_capture_0", il);
             ggml_build_forward_expand(gf, qcap);
 
-            ggml_tensor * kcap = ggml_cont(ctx0, k);
+            ggml_tensor * kcap = ggml_cast(ctx0, k, GGML_TYPE_F32);
             cb(kcap, "evoke_key_capture_0", il);
             ggml_build_forward_expand(gf, kcap);
         }
