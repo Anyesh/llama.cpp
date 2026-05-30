@@ -4263,6 +4263,16 @@ size_t llama_attn_capture_get_written(const llama_context * ctx) {
 size_t llama_kv_block_save(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t cap) {
     ctx->synchronize();
 
+    // A block evicted under compact eviction can carry a pending deferred RoPE shift:
+    // seq_add updates pos[i] immediately but defers the K rotation to the next decode.
+    // block_write serializes K verbatim, so without flushing that shift first the saved
+    // K is rotated for the OLD position while the metadata records the NEW one, and
+    // recovery re-anchors by the wrong delta (recall degrades under eviction churn).
+    // Apply the pending shift now, mirroring the flush llama_kv_block_load does after
+    // restore, so the serialized K matches the recorded positions.
+    ctx->memory_update(false);
+    ctx->synchronize();
+
     llama_kv_cache * kv = llama_get_kv_cache(ctx);
     if (!kv) {
         LLAMA_LOG_ERROR("%s: context is not backed by an attention KV cache\n", __func__);
