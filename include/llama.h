@@ -1054,6 +1054,29 @@ extern "C" {
             const struct llama_context * ctx);
 
     //
+    // EVOKE: per-layer residual (layer input) capture for workspace scoring
+    //
+
+    // Enable or disable capture of the residual stream entering layer lid.
+    // While enabled, each llama_decode writes the f32 layer inputs of the
+    // batch tokens (n_tokens x n_embd) into a context-owned buffer readable
+    // via llama_get_embeddings_layer_inp. Declared here so the symbols get
+    // C linkage; the implementations predate this declaration and were only
+    // reachable from C++.
+    LLAMA_API void llama_set_embeddings_layer_inp(
+            struct llama_context * ctx,
+                        uint32_t   lid,
+                            bool   value);
+
+    // Pointer to the captured layer inputs of the last decode for layer lid
+    // (row-major n_tokens x n_embd). Aborts if capture for lid was never
+    // enabled or no decode has run since; callers gate on their own decode
+    // bookkeeping.
+    LLAMA_API float * llama_get_embeddings_layer_inp(
+            struct llama_context * ctx,
+                        uint32_t   lid);
+
+    //
     // Decoding
     //
 
