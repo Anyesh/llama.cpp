@@ -27,6 +27,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <filesystem>
 #include <fstream>
 #include <list>
 #include <regex>
@@ -496,13 +497,15 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // handle hf_plan tasks
-    auto add_tasks = [&opts, &tasks](const hf_cache::hf_files & model_files, common_params_model & model) {
+    auto add_tasks = [&opts, &tasks](const hf_cache::hf_files  & model_files,
+                                    const hf_cache::hf_file    & primary,
+                                    common_params_model        & model) {
         for (size_t i = 0; i < model_files.size(); ++i) {
             auto & model_file = model_files[i];
-            bool is_first = (i == 0);
-            tasks.emplace_back(model_file, opts, [&, is_first]() {
-                if (is_first) {
-                    // only use first part as model path
+            bool is_primary = (model_file.path == primary.path);
+            tasks.emplace_back(model_file, opts, [&, is_primary]() {
+                if (is_primary) {
+                    // the primary file is the first split (00001-of), use it as model path
                     model.path = hf_cache::finalize_file(model_file);
                 } else {
                     hf_cache::finalize_file(model_file);
@@ -511,7 +514,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     };
     if (!plan.model_files.empty()) {
-        add_tasks(plan.model_files, params.model);
+        add_tasks(plan.model_files, plan.primary, params.model);
     }
     if (!plan.mmproj.local_path.empty()) {
         tasks.emplace_back(plan.mmproj, opts, [&]() {
@@ -539,12 +542,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 
     // handle plan_spec (e.g. --spec-draft-hf)
     if (!plan_spec.model_files.empty()) {
-        add_tasks(plan_spec.model_files, params.speculative.draft.mparams);
+        add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams);
     }
 
     // handle vocoder plan (e.g. --hf-repo-v)
     if (!plan_voc.model_files.empty()) {
-        add_tasks(plan_voc.model_files, params.vocoder.model);
+        add_tasks(plan_voc.model_files, plan_voc.primary, params.vocoder.model);
     }
 
     // run all tasks in parallel
@@ -716,9 +719,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
         // model is required (except for server)
         // TODO @ngxson : maybe show a list of available models in CLI in this case
-        if (params.model.path.empty()
-                && !params.usage
-                && !params.completion) {
+        bool can_skip_model = params.usage || params.completion || !params.server_base.empty();
+        if (!can_skip_model && params.model.path.empty()) {
             throw std::invalid_argument("error: --model is required\n");
         }
     }
@@ -1238,6 +1240,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.completion = true;
         }
     ));
+    add_opt(common_arg(
+        {"--server-base"}, "URL",
+        string_format("connect to this server instead of starting a new one, example: 'http://localhost:8080' (default: none)"),
+        [](common_params & params, const std::string & value) {
+            params.server_base = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--verbose-prompt"},
         string_format("print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false"),
@@ -3449,9 +3458,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LOG_FILE"));
     add_opt(common_arg(
         {"--log-prompts-dir"}, "PATH",
-        "Log prompts to directory (only used for debugging, default: disabled)",
+        "Log prompts to directory (auto-created if not present; only used for debugging, default: disabled)",
         [](common_params & params, const std::string & value) {
             params.path_prompts_log_dir = value;
+            std::error_code ec;
+            std::filesystem::create_directories(value, ec);
+            if (ec) {
+                fprintf(stderr, "warning: failed to create prompts-log-dir '%s': %s\n", value.c_str(), ec.message().c_str());
+            }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
