@@ -1815,8 +1815,12 @@ void llama_model_base::init_expert_streaming(llama_model_loader & ml) {
     pimpl->expert_streamer->set_files(ml.file_paths);
     pimpl->moe_stream_max_tokens = max_tokens;
     // gemma4 builds top-k before the shared-expert MLP and emits the ffn_mlp join
-    // anchor the two-phase callback relies on
-    pimpl->moe_stream_overlap = arch == LLM_ARCH_GEMMA4;
+    // anchor the two-phase callback relies on; the env var forces the synchronous
+    // path so overlap gains can be measured against the same binary
+    pimpl->moe_stream_overlap = arch == LLM_ARCH_GEMMA4 && getenv("LLAMA_MOE_STREAM_NO_OVERLAP") == nullptr;
+    if (arch == LLM_ARCH_GEMMA4 && !pimpl->moe_stream_overlap) {
+        LLAMA_LOG_INFO("%s: expert streaming IO/compute overlap disabled by env\n", __func__);
+    }
 
     for (const auto & e : entries) {
         ggml_tensor * t = e.tensor;
