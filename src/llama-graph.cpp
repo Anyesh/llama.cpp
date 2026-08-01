@@ -2000,12 +2000,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // stream all matmuls of the layer or none: the eval callback loads every
         // pool of the layer for the ids it sees on the topk node
-        const bool complete = ms_down != nullptr &&
+        bool complete = ms_down != nullptr &&
             (gate_up_exps ? ms_gate_up != nullptr
                           : (ms_up != nullptr && (!gate_exps || ms_gate != nullptr)));
 
+        // debug bisection: stream only one matmul kind, the rest read the originals
+        if (const char * only = getenv("LLAMA_MOE_STREAM_ONLY")) {
+            if (strcmp(only, "down") == 0) {
+                ms_gate_up = nullptr;
+                ms_up      = nullptr;
+                ms_gate    = nullptr;
+                complete   = ms_down != nullptr;
+            } else if (strcmp(only, "gate_up") == 0) {
+                ms_down  = nullptr;
+                complete = ms_gate_up != nullptr || ms_up != nullptr;
+            }
+        }
+
         if (complete) {
-            ggml_tensor * slot_ids = ms_down->slot_ids;
+            const llama_moe_stream_mapping * any = ms_down ? ms_down : ms_gate_up ? ms_gate_up : ms_up;
+            ggml_tensor * slot_ids = any->slot_ids;
             GGML_ASSERT(slot_ids->ne[0] == n_expert_used);
             ids_pool = slot_ids;
             if (slot_ids->ne[1] != n_tokens) {

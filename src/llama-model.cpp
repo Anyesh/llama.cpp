@@ -2227,6 +2227,34 @@ bool llama_model::moe_stream_overlap() const {
     return pimpl->moe_stream_overlap;
 }
 
+bool llama_model::moe_stream_verify_slab(int32_t il, int32_t expert_id, int32_t slot) const {
+    bool ok = true;
+    for (const auto & [orig, m] : pimpl->moe_stream_map) {
+        if (m.il != il) {
+            continue;
+        }
+        if (orig->buffer && !ggml_backend_buffer_is_host(orig->buffer)) {
+            continue;
+        }
+        if (!m.pool->buffer || !ggml_backend_buffer_is_host(m.pool->buffer)) {
+            continue;
+        }
+        const size_t nb2 = orig->nb[2];
+        const uint8_t * a = (const uint8_t *) orig->data   + (size_t) expert_id * nb2;
+        const uint8_t * b = (const uint8_t *) m.pool->data + (size_t) slot      * nb2;
+        if (memcmp(a, b, nb2) != 0) {
+            size_t first = 0;
+            while (first < nb2 && a[first] == b[first]) {
+                first++;
+            }
+            LLAMA_LOG_ERROR("%s: layer %d expert %d slot %d tensor %s: slab differs from original at byte %zu of %zu\n",
+                    __func__, il, expert_id, slot, orig->name, first, nb2);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 bool llama_model::moe_stream_bind() const {
     bool expected = false;
     return pimpl->moe_stream_bound.compare_exchange_strong(expected, true);

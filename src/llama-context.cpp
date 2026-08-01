@@ -1415,6 +1415,15 @@ bool llama_context::moe_stream_eval(ggml_tensor * t, bool ask) {
         streamer->execute(il, moe_stream_misses);
     }
 
+    if (getenv("LLAMA_MOE_STREAM_VERIFY")) {
+        if (model.moe_stream_overlap()) {
+            streamer->join(il);
+        }
+        for (size_t i = 0; i < moe_stream_misses.size(); i++) {
+            model.moe_stream_verify_slab(il, moe_stream_misses[i].expert_id, moe_stream_misses[i].slot);
+        }
+    }
+
     ggml_backend_tensor_set(slot_ids, moe_stream_slots.data(), 0, n * sizeof(int32_t));
 
     return true;

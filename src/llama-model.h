@@ -689,6 +689,9 @@ struct llama_model {
     bool moe_stream_bind() const;
     void moe_stream_unbind() const;
 
+    // debug: compare a loaded pool slab against the mmap-backed original tensor
+    bool moe_stream_verify_slab(int32_t il, int32_t expert_id, int32_t slot) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
