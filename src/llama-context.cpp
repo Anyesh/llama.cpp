@@ -1363,8 +1363,23 @@ bool llama_context::moe_stream_eval(ggml_tensor * t, bool ask) {
         return false;
     }
 
-    constexpr size_t prefix_len = sizeof("ffn_moe_topk-") - 1;
-    if (strncmp(t->name, "ffn_moe_topk-", prefix_len) != 0) {
+    constexpr size_t topk_len = sizeof("ffn_moe_topk-") - 1;
+    constexpr size_t join_len = sizeof("ffn_mlp-")      - 1;
+
+    // join anchor: the shared-FFN output that the overlap-ordered graph computes
+    // between the top-k dispatch and the first pool matmul
+    if (model.moe_stream_overlap() && strncmp(t->name, "ffn_mlp-", join_len) == 0) {
+        if (t->ne[1] > model.moe_stream_max_tokens()) {
+            return false;
+        }
+        if (ask) {
+            return true;
+        }
+        streamer->join((int32_t) strtol(t->name + join_len, nullptr, 10));
+        return true;
+    }
+
+    if (strncmp(t->name, "ffn_moe_topk-", topk_len) != 0) {
         return false;
     }
     // larger batches (prefill) run against the mmap-backed expert tensors instead
@@ -1377,7 +1392,7 @@ bool llama_context::moe_stream_eval(ggml_tensor * t, bool ask) {
         return true;
     }
 
-    const int32_t il = (int32_t) strtol(t->name + prefix_len, nullptr, 10);
+    const int32_t il = (int32_t) strtol(t->name + topk_len, nullptr, 10);
 
     ggml_tensor * slot_ids = model.moe_stream_slot_ids(il);
     if (slot_ids == nullptr) {
@@ -1391,7 +1406,14 @@ bool llama_context::moe_stream_eval(ggml_tensor * t, bool ask) {
     ggml_backend_tensor_get(t, moe_stream_ids.data(), 0, n * sizeof(int32_t));
 
     streamer->plan(il, moe_stream_ids.data(), n, moe_stream_misses, moe_stream_slots.data());
-    streamer->execute(il, moe_stream_misses);
+
+    if (model.moe_stream_overlap()) {
+        // reads run while the sched computes the shared-expert branch; the join
+        // anchor blocks before the pools are consumed
+        streamer->dispatch(il, moe_stream_misses);
+    } else {
+        streamer->execute(il, moe_stream_misses);
+    }
 
     ggml_backend_tensor_set(slot_ids, moe_stream_slots.data(), 0, n * sizeof(int32_t));
 

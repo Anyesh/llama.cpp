@@ -681,6 +681,10 @@ struct llama_model {
 
     int32_t moe_stream_max_tokens() const;
 
+    // true when the arch orders top-k before the shared-expert branch, letting the
+    // eval callback overlap expert disk reads with shared-FFN compute
+    bool moe_stream_overlap() const;
+
     // the slot cache holds one expert set; only one context may stream at a time
     bool moe_stream_bind() const;
     void moe_stream_unbind() const;

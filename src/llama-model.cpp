@@ -1038,6 +1038,7 @@ struct llama_model::impl {
     std::unordered_map<const ggml_tensor *, llama_moe_stream_mapping> moe_stream_map;
     std::map<int32_t, ggml_tensor *> moe_stream_slot_ids;
     int32_t moe_stream_max_tokens = 0;
+    bool moe_stream_overlap = false;
     mutable std::atomic<bool> moe_stream_bound{false};
 };
 
@@ -1813,6 +1814,9 @@ void llama_model_base::init_expert_streaming(llama_model_loader & ml) {
     pimpl->expert_streamer = std::make_unique<llama_expert_streamer>(n_slots, params.moe_stream_io_threads);
     pimpl->expert_streamer->set_files(ml.file_paths);
     pimpl->moe_stream_max_tokens = max_tokens;
+    // gemma4 builds top-k before the shared-expert MLP and emits the ffn_mlp join
+    // anchor the two-phase callback relies on
+    pimpl->moe_stream_overlap = arch == LLM_ARCH_GEMMA4;
 
     for (const auto & e : entries) {
         ggml_tensor * t = e.tensor;
@@ -2213,6 +2217,10 @@ ggml_tensor * llama_model::moe_stream_slot_ids(int32_t il) const {
 
 int32_t llama_model::moe_stream_max_tokens() const {
     return pimpl->moe_stream_max_tokens;
+}
+
+bool llama_model::moe_stream_overlap() const {
+    return pimpl->moe_stream_overlap;
 }
 
 bool llama_model::moe_stream_bind() const {
