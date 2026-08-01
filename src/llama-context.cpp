@@ -90,6 +90,10 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    if (model.expert_streamer() && !model.moe_stream_bind()) {
+        throw std::runtime_error("expert streaming supports only one context per model");
+    }
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -476,6 +480,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (model.expert_streamer()) {
+        model.moe_stream_unbind();
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1340,9 +1348,44 @@ bool llama_context::graph_eval_callback(ggml_tensor * t, bool ask, void * user_d
 }
 
 bool llama_context::moe_stream_eval(ggml_tensor * t, bool ask) {
-    GGML_UNUSED(t);
-    GGML_UNUSED(ask);
-    return false;
+    auto * streamer = model.expert_streamer();
+    if (streamer == nullptr) {
+        return false;
+    }
+
+    constexpr size_t prefix_len = sizeof("ffn_moe_topk-") - 1;
+    if (strncmp(t->name, "ffn_moe_topk-", prefix_len) != 0) {
+        return false;
+    }
+    // larger batches (prefill) run against the mmap-backed expert tensors instead
+    // of the pools and must not pay for streaming
+    if (t->type != GGML_TYPE_I32 || t->ne[1] > model.moe_stream_max_tokens()) {
+        return false;
+    }
+
+    if (ask) {
+        return true;
+    }
+
+    const int32_t il = (int32_t) strtol(t->name + prefix_len, nullptr, 10);
+
+    ggml_tensor * slot_ids = model.moe_stream_slot_ids(il);
+    if (slot_ids == nullptr) {
+        return true;
+    }
+
+    const int32_t n = (int32_t) ggml_nelements(t);
+    moe_stream_ids.resize(n);
+    moe_stream_slots.resize(n);
+
+    ggml_backend_tensor_get(t, moe_stream_ids.data(), 0, n * sizeof(int32_t));
+
+    streamer->plan(il, moe_stream_ids.data(), n, moe_stream_misses, moe_stream_slots.data());
+    streamer->execute(il, moe_stream_misses);
+
+    ggml_backend_tensor_set(slot_ids, moe_stream_slots.data(), 0, n * sizeof(int32_t));
+
+    return true;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -2478,6 +2521,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_stream_model =*/ model.expert_streamer() ? &model : nullptr,
     };
 }
 

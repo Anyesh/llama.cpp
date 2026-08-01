@@ -1360,6 +1360,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    moe_stream_model (params.moe_stream_model),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1414,8 +1415,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * w_s,
+          ggml_tensor * w_pool,
+          ggml_tensor * ids_pool) const {
+    // only the main matmul may read the pool with slot ids; w_s, lora and any
+    // caller-side biases must keep the real expert ids
+    ggml_tensor * res = w_pool
+        ? ggml_mul_mat_id(ctx0, w_pool, cur, ids_pool)
+        : ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -1983,9 +1990,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    const llama_moe_stream_mapping * ms_gate_up = nullptr;
+    const llama_moe_stream_mapping * ms_up      = nullptr;
+    const llama_moe_stream_mapping * ms_gate    = nullptr;
+    const llama_moe_stream_mapping * ms_down    = nullptr;
+
+    ggml_tensor * ids_pool = nullptr;
+
+    if (moe_stream_model && n_tokens <= moe_stream_model->moe_stream_max_tokens()) {
+        ms_down = moe_stream_model->moe_stream_mapping(down_exps);
+        if (gate_up_exps) {
+            ms_gate_up = moe_stream_model->moe_stream_mapping(gate_up_exps);
+        }
+        if (up_exps) {
+            ms_up = moe_stream_model->moe_stream_mapping(up_exps);
+        }
+        if (gate_exps) {
+            ms_gate = moe_stream_model->moe_stream_mapping(gate_exps);
+        }
+
+        // stream all matmuls of the layer or none: the eval callback loads every
+        // pool of the layer for the ids it sees on the topk node
+        const bool complete = ms_down != nullptr &&
+            (gate_up_exps ? ms_gate_up != nullptr
+                          : (ms_up != nullptr && (!gate_exps || ms_gate != nullptr)));
+
+        if (complete) {
+            ggml_tensor * slot_ids = ms_down->slot_ids;
+            GGML_ASSERT(slot_ids->ne[0] == n_expert_used);
+            ids_pool = slot_ids;
+            if (slot_ids->ne[1] != n_tokens) {
+                ids_pool = ggml_view_2d(ctx0, slot_ids, slot_ids->ne[0], n_tokens, slot_ids->nb[1], 0);
+            }
+        } else {
+            ms_gate_up = nullptr;
+            ms_up      = nullptr;
+            ms_gate    = nullptr;
+            ms_down    = nullptr;
+        }
+    }
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s,
+                ms_gate_up ? ms_gate_up->pool : nullptr, ids_pool); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2004,7 +2052,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s,
+                ms_up ? ms_up->pool : nullptr, ids_pool); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2017,7 +2066,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s,
+                    ms_gate ? ms_gate->pool : nullptr, ids_pool); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2106,7 +2156,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s,
+            ms_down ? ms_down->pool : nullptr, ids_pool); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
