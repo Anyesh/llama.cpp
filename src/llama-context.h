@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-expert-streamer.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -266,6 +267,10 @@ private:
     static bool graph_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
 
     bool moe_stream_eval(struct ggml_tensor * t, bool ask);
+
+    std::vector<int32_t> moe_stream_ids;
+    std::vector<int32_t> moe_stream_slots;
+    std::vector<llama_expert_streamer::miss> moe_stream_misses;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)

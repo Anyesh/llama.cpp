@@ -23,6 +23,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1035,7 +1036,9 @@ struct llama_model::impl {
     ggml_context_ptr        moe_stream_ctx;
     ggml_backend_buffer_ptr moe_stream_buf;
     std::unordered_map<const ggml_tensor *, llama_moe_stream_mapping> moe_stream_map;
+    std::map<int32_t, ggml_tensor *> moe_stream_slot_ids;
     int32_t moe_stream_max_tokens = 0;
+    mutable std::atomic<bool> moe_stream_bound{false};
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1674,6 +1677,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 void llama_model_base::init_expert_streaming(llama_model_loader & ml) {
     GGML_ASSERT(ml.stream_exps_pattern != nullptr);
 
+    if (arch == LLM_ARCH_GROVEMOE) {
+        // grovemoe rewrites the selected expert ids after top-k, so the ids the
+        // eval callback reads would not be the ids the matmul uses
+        LLAMA_LOG_WARN("%s: expert streaming is not supported for this architecture, falling back to CPU experts\n", __func__);
+        return;
+    }
+
+#ifndef _WIN32
+    // a captured CUDA graph would replay the matmuls without running the eval
+    // callback that reloads the pools, so it must not be used while streaming
+    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
+
     struct stream_entry {
         const llama_model_loader::llama_tensor_weight * weight;
         ggml_tensor * tensor; // the model-owned tensor the graph references; the
@@ -1761,6 +1777,7 @@ void llama_model_base::init_expert_streaming(llama_model_loader & ml) {
         ggml_format_name(slot_ids, "blk.%d.moe_slot_ids", il);
         slot_ids_by_layer[il] = slot_ids;
     }
+    pimpl->moe_stream_slot_ids = slot_ids_by_layer;
 
     for (const auto & e : entries) {
         ggml_tensor * t = e.tensor;
@@ -2189,8 +2206,22 @@ const llama_moe_stream_mapping * llama_model::moe_stream_mapping(const ggml_tens
     return it == pimpl->moe_stream_map.end() ? nullptr : &it->second;
 }
 
+ggml_tensor * llama_model::moe_stream_slot_ids(int32_t il) const {
+    const auto it = pimpl->moe_stream_slot_ids.find(il);
+    return it == pimpl->moe_stream_slot_ids.end() ? nullptr : it->second;
+}
+
 int32_t llama_model::moe_stream_max_tokens() const {
     return pimpl->moe_stream_max_tokens;
+}
+
+bool llama_model::moe_stream_bind() const {
+    bool expected = false;
+    return pimpl->moe_stream_bound.compare_exchange_strong(expected, true);
+}
+
+void llama_model::moe_stream_unbind() const {
+    pimpl->moe_stream_bound.store(false);
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

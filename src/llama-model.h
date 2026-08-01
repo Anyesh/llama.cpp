@@ -677,7 +677,13 @@ struct llama_model {
     // pool mapping for a streamed expert weight tensor, or nullptr if the tensor is not streamed
     const llama_moe_stream_mapping * moe_stream_mapping(const ggml_tensor * w) const;
 
+    ggml_tensor * moe_stream_slot_ids(int32_t il) const;
+
     int32_t moe_stream_max_tokens() const;
+
+    // the slot cache holds one expert set; only one context may stream at a time
+    bool moe_stream_bind() const;
+    void moe_stream_unbind() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

@@ -18,6 +18,8 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
+struct llama_moe_stream_mapping;
 
 struct llama_memory_context_i;
 
@@ -711,6 +713,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // set when the model streams MoE experts from disk; build_moe_ffn then routes
+    // decode-sized batches through the resident pools
+    const llama_model * moe_stream_model = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -934,6 +940,8 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    const llama_model * moe_stream_model = nullptr;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -956,12 +964,17 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
-    // do mat_mul_id, while optionally apply lora and per-expert scale
+    // do mat_mul_id, while optionally apply lora and per-expert scale.
+    // w_pool/ids_pool substitute ONLY the main matmul with a streamed expert pool
+    // indexed by slot ids; lora, biases and per-expert scales must keep indexing
+    // by the real expert ids or the result is silently wrong
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * w_pool = nullptr,
+              ggml_tensor * ids_pool = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Generate a tiny random qwen2moe GGUF for expert-streaming tests.
+"""Generate a tiny random MoE GGUF for expert-streaming tests.
 
 The model is deliberately small but uses Q4_K-compatible dimensions (multiples
 of 256) so the F16 output can be requantized with llama-quantize. Per-expert
 .scale tensors are included with distinct values per expert, so any confusion
-between real expert ids and pool slot ids changes the logits.
+between real expert ids and pool slot ids changes the logits. Note that only
+the qwen3moe graph applies those scales; qwen2moe loads but ignores them, so
+use qwen3moe when the test must cover the per-expert scale path.
 
-Usage: make-tiny-moe-gguf.py [-o tiny-moe.gguf] [--seed 42]
+Usage: make-tiny-moe-gguf.py [-o tiny-moe.gguf] [--arch qwen2moe|qwen3moe] [--seed 42]
 """
 
 import argparse
@@ -33,6 +35,7 @@ N_CTX = 512
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-o", "--output", default="tiny-moe.gguf")
+    parser.add_argument("--arch", choices=("qwen2moe", "qwen3moe"), default="qwen2moe")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -46,7 +49,7 @@ def main() -> int:
     types += [gguf.TokenType.BYTE] * N_VOCAB_BYTES
     n_vocab = len(tokens)
 
-    writer = gguf.GGUFWriter(args.output, "qwen2moe")
+    writer = gguf.GGUFWriter(args.output, args.arch)
     writer.add_name("tiny-moe-test")
     writer.add_context_length(N_CTX)
     writer.add_embedding_length(N_EMBD)
@@ -59,7 +62,8 @@ def main() -> int:
     writer.add_expert_count(N_EXPERT)
     writer.add_expert_used_count(N_EXPERT_USED)
     writer.add_expert_feed_forward_length(N_FF_EXP)
-    writer.add_expert_shared_feed_forward_length(N_FF_SHEXP)
+    if args.arch == "qwen2moe":
+        writer.add_expert_shared_feed_forward_length(N_FF_SHEXP)
 
     writer.add_tokenizer_model("llama")
     writer.add_token_list(tokens)
@@ -81,6 +85,14 @@ def main() -> int:
         writer.add_tensor(p + "attn_k.weight", w(n_embd_gqa, N_EMBD))
         writer.add_tensor(p + "attn_v.weight", w(n_embd_gqa, N_EMBD))
         writer.add_tensor(p + "attn_output.weight", w(N_EMBD, N_EMBD))
+        if args.arch == "qwen3moe":
+            n_embd_head = N_EMBD // N_HEAD
+            writer.add_tensor(
+                p + "attn_q_norm.weight", np.ones(n_embd_head, dtype=np.float32)
+            )
+            writer.add_tensor(
+                p + "attn_k_norm.weight", np.ones(n_embd_head, dtype=np.float32)
+            )
         writer.add_tensor(p + "ffn_norm.weight", np.ones(N_EMBD, dtype=np.float32))
 
         writer.add_tensor(p + "ffn_gate_inp.weight", w(N_EXPERT, N_EMBD))
@@ -92,10 +104,11 @@ def main() -> int:
             scales = (0.5 + 0.125 * np.arange(N_EXPERT) + 0.01 * i).astype(np.float32)
             writer.add_tensor(p + f"ffn_{kind}_exps.scale", scales)
 
-        writer.add_tensor(p + "ffn_gate_inp_shexp.weight", w(N_EMBD))
-        writer.add_tensor(p + "ffn_gate_shexp.weight", w(N_FF_SHEXP, N_EMBD))
-        writer.add_tensor(p + "ffn_up_shexp.weight", w(N_FF_SHEXP, N_EMBD))
-        writer.add_tensor(p + "ffn_down_shexp.weight", w(N_EMBD, N_FF_SHEXP))
+        if args.arch == "qwen2moe":
+            writer.add_tensor(p + "ffn_gate_inp_shexp.weight", w(N_EMBD))
+            writer.add_tensor(p + "ffn_gate_shexp.weight", w(N_FF_SHEXP, N_EMBD))
+            writer.add_tensor(p + "ffn_up_shexp.weight", w(N_FF_SHEXP, N_EMBD))
+            writer.add_tensor(p + "ffn_down_shexp.weight", w(N_EMBD, N_FF_SHEXP))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
