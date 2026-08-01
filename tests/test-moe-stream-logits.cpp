@@ -1,6 +1,8 @@
 // greedy-decodes the same prompt with expert streaming off and on and requires
 // bitwise-identical logits at every step: the same kernels run on the same
-// bytes, only the addressing through the slot pools differs
+// bytes, only the addressing through the slot pools differs.
+// the two runs are sequential so peak memory stays at one model, which lets the
+// test run on machines whose RAM holds only one copy of the dense weights
 
 #include "llama.h"
 
@@ -40,6 +42,29 @@ static run_state make_run(const char * model_path, bool stream, int32_t slots) {
     return r;
 }
 
+static void free_run(run_state & r) {
+    if (r.ctx) {
+        llama_free(r.ctx);
+        r.ctx = nullptr;
+    }
+    if (r.model) {
+        llama_model_free(r.model);
+        r.model = nullptr;
+    }
+}
+
+static bool decode_tokens(llama_context * ctx, llama_batch & batch, const std::vector<llama_token> & toks, int n_past) {
+    batch.n_tokens = (int32_t) toks.size();
+    for (size_t i = 0; i < toks.size(); i++) {
+        batch.token[i]     = toks[i];
+        batch.pos[i]       = n_past + (int32_t) i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = i == toks.size() - 1;
+    }
+    return llama_decode(ctx, batch) == 0;
+}
+
 int main(int argc, char * argv[]) {
     char * model_path = get_model_or_exit(argc, argv);
 
@@ -47,87 +72,104 @@ int main(int argc, char * argv[]) {
     // fewer slots than experts so the identity test also exercises eviction
     const int n_slots  = argc > 3 ? atoi(argv[3]) : 4;
 
-    run_state base   = make_run(model_path, false, n_slots);
-    run_state stream = make_run(model_path, true,  n_slots);
-    if (!base.model || !base.ctx || !stream.model || !stream.ctx) {
-        fprintf(stderr, "failed to load %s\n", model_path);
-        return 1;
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(base.model);
-    const int n_vocab = llama_vocab_n_tokens(vocab);
-
     const char * prompt = "the quick brown fox jumps over the lazy dog";
-    std::vector<llama_token> tokens(256);
-    const int n_prompt = llama_tokenize(vocab, prompt, (int32_t) strlen(prompt), tokens.data(), (int32_t) tokens.size(), true, false);
-    if (n_prompt < 1) {
-        fprintf(stderr, "tokenization failed (%d)\n", n_prompt);
-        return 1;
-    }
-    tokens.resize(n_prompt);
 
-    llama_batch batch = llama_batch_init(512, 0, 1);
+    std::vector<llama_token> prompt_tokens(256);
+    int n_vocab = 0;
 
-    auto decode = [&](llama_context * ctx, const std::vector<llama_token> & toks, int n_past) {
-        batch.n_tokens = (int32_t) toks.size();
-        for (size_t i = 0; i < toks.size(); i++) {
-            batch.token[i]     = toks[i];
-            batch.pos[i]       = n_past + (int32_t) i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = i == toks.size() - 1;
+    std::vector<std::vector<float>> ref_logits;
+    std::vector<llama_token>        ref_tokens;
+
+    // pass 1: baseline, record logits and the greedy continuation
+    {
+        run_state base = make_run(model_path, false, n_slots);
+        if (!base.model || !base.ctx) {
+            fprintf(stderr, "failed to load %s (baseline)\n", model_path);
+            return 1;
         }
-        return llama_decode(ctx, batch);
-    };
 
-    if (decode(base.ctx, tokens, 0) != 0 || decode(stream.ctx, tokens, 0) != 0) {
-        fprintf(stderr, "prompt decode failed\n");
-        return 1;
-    }
+        const llama_vocab * vocab = llama_model_get_vocab(base.model);
+        n_vocab = llama_vocab_n_tokens(vocab);
 
-    int n_past = n_prompt;
-    int n_checked = 0;
+        const int n_prompt = llama_tokenize(vocab, prompt, (int32_t) strlen(prompt),
+                prompt_tokens.data(), (int32_t) prompt_tokens.size(), true, false);
+        if (n_prompt < 1) {
+            fprintf(stderr, "tokenization failed (%d)\n", n_prompt);
+            return 1;
+        }
+        prompt_tokens.resize(n_prompt);
 
-    for (int step = 0; step < n_decode; step++) {
-        const float * logits_base   = llama_get_logits_ith(base.ctx,   -1);
-        const float * logits_stream = llama_get_logits_ith(stream.ctx, -1);
+        llama_batch batch = llama_batch_init(512, 0, 1);
+        if (!decode_tokens(base.ctx, batch, prompt_tokens, 0)) {
+            fprintf(stderr, "baseline prompt decode failed\n");
+            return 1;
+        }
 
-        if (memcmp(logits_base, logits_stream, n_vocab * sizeof(float)) != 0) {
-            int n_diff = 0;
-            float max_diff = 0.0f;
-            for (int i = 0; i < n_vocab; i++) {
-                if (logits_base[i] != logits_stream[i]) {
-                    n_diff++;
-                    max_diff = std::fmax(max_diff, std::fabs(logits_base[i] - logits_stream[i]));
+        int n_past = n_prompt;
+        for (int step = 0; step < n_decode; step++) {
+            const float * logits = llama_get_logits_ith(base.ctx, -1);
+            ref_logits.emplace_back(logits, logits + n_vocab);
+
+            llama_token best = 0;
+            for (int i = 1; i < n_vocab; i++) {
+                if (logits[i] > logits[best]) {
+                    best = i;
                 }
             }
-            fprintf(stderr, "FAIL: logits diverge at step %d: %d/%d values differ, max abs diff %g\n",
-                    step, n_diff, n_vocab, max_diff);
-            return 1;
-        }
-        n_checked++;
+            ref_tokens.push_back(best);
 
-        llama_token best = 0;
-        for (int i = 1; i < n_vocab; i++) {
-            if (logits_base[i] > logits_base[best]) {
-                best = i;
+            if (!decode_tokens(base.ctx, batch, {best}, n_past)) {
+                fprintf(stderr, "baseline decode failed at step %d\n", step);
+                return 1;
             }
+            n_past++;
         }
-
-        const std::vector<llama_token> next = {best};
-        if (decode(base.ctx, next, n_past) != 0 || decode(stream.ctx, next, n_past) != 0) {
-            fprintf(stderr, "decode failed at step %d\n", step);
-            return 1;
-        }
-        n_past++;
+        llama_batch_free(batch);
+        free_run(base);
     }
 
-    llama_batch_free(batch);
-    llama_free(base.ctx);
-    llama_free(stream.ctx);
-    llama_model_free(base.model);
-    llama_model_free(stream.model);
+    // pass 2: streamed, replay the recorded continuation and compare per step
+    {
+        run_state stream = make_run(model_path, true, n_slots);
+        if (!stream.model || !stream.ctx) {
+            fprintf(stderr, "failed to load %s (streamed)\n", model_path);
+            return 1;
+        }
 
-    printf("ok: %d steps bitwise-identical logits (%d slots)\n", n_checked, n_slots);
+        llama_batch batch = llama_batch_init(512, 0, 1);
+        if (!decode_tokens(stream.ctx, batch, prompt_tokens, 0)) {
+            fprintf(stderr, "streamed prompt decode failed\n");
+            return 1;
+        }
+
+        int n_past = (int) prompt_tokens.size();
+        for (int step = 0; step < n_decode; step++) {
+            const float * logits = llama_get_logits_ith(stream.ctx, -1);
+
+            if (memcmp(ref_logits[step].data(), logits, n_vocab * sizeof(float)) != 0) {
+                int n_diff = 0;
+                float max_diff = 0.0f;
+                for (int i = 0; i < n_vocab; i++) {
+                    if (ref_logits[step][i] != logits[i]) {
+                        n_diff++;
+                        max_diff = std::fmax(max_diff, std::fabs(ref_logits[step][i] - logits[i]));
+                    }
+                }
+                fprintf(stderr, "FAIL: logits diverge at step %d: %d/%d values differ, max abs diff %g\n",
+                        step, n_diff, n_vocab, max_diff);
+                return 1;
+            }
+
+            if (!decode_tokens(stream.ctx, batch, {ref_tokens[step]}, n_past)) {
+                fprintf(stderr, "streamed decode failed at step %d\n", step);
+                return 1;
+            }
+            n_past++;
+        }
+        llama_batch_free(batch);
+        free_run(stream);
+    }
+
+    printf("ok: %d steps bitwise-identical logits (%d slots)\n", n_decode, n_slots);
     return 0;
 }
