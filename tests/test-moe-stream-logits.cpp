@@ -104,13 +104,21 @@ int main(int argc, char * argv[]) {
         const llama_vocab * vocab = llama_model_get_vocab(base.model);
         n_vocab = llama_vocab_n_tokens(vocab);
 
-        const int n_prompt = llama_tokenize(vocab, prompt, (int32_t) strlen(prompt),
-                prompt_tokens.data(), (int32_t) prompt_tokens.size(), true, false);
-        if (n_prompt < 1) {
-            fprintf(stderr, "tokenization failed (%d)\n", n_prompt);
-            return 1;
+        if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
+            // stub vocabs (e.g. test-llama-archs models) cannot tokenize text
+            prompt_tokens.resize(9);
+            for (size_t i = 0; i < prompt_tokens.size(); i++) {
+                prompt_tokens[i] = (llama_token) (1 + (int) i % (n_vocab - 1));
+            }
+        } else {
+            const int n_prompt = llama_tokenize(vocab, prompt, (int32_t) strlen(prompt),
+                    prompt_tokens.data(), (int32_t) prompt_tokens.size(), true, false);
+            if (n_prompt < 1) {
+                fprintf(stderr, "tokenization failed (%d)\n", n_prompt);
+                return 1;
+            }
+            prompt_tokens.resize(n_prompt);
         }
-        prompt_tokens.resize(n_prompt);
 
         llama_batch batch = llama_batch_init(512, 0, 1);
         if (!decode_tokens(base.ctx, batch, prompt_tokens, 0)) {
@@ -118,7 +126,7 @@ int main(int argc, char * argv[]) {
             return 1;
         }
 
-        int n_past = n_prompt;
+        int n_past = (int) prompt_tokens.size();
         for (int step = 0; step < n_decode; step++) {
             const float * logits = llama_get_logits_ith(base.ctx, -1);
             ref_logits.emplace_back(logits, logits + n_vocab);
