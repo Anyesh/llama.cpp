@@ -79,6 +79,13 @@ static bool decode_tokens(llama_context * ctx, llama_batch & batch, const std::v
 }
 
 int main(int argc, char * argv[]) {
+    // the eval callback that drives streaming keeps the top-k node observable,
+    // which prevents backend router fusions; the baseline must run unfused too or
+    // a near-tie in expert selection under a different kernel breaks identity
+#ifndef _WIN32
+    setenv("GGML_CUDA_DISABLE_FUSION", "1", 0);
+#endif
+
     char * model_path = get_model_or_exit(argc, argv);
 
     const int n_decode = argc > 2 ? atoi(argv[2]) : 160;
