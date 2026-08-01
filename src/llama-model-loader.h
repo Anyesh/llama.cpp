@@ -82,6 +82,9 @@ struct llama_model_loader {
     bool load_mtp;
 
     llama_files files;
+    // per entry in files; empty when the file came from an external FILE handle,
+    // in which case expert streaming cannot reopen it
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 

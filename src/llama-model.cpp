@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-expert-streamer.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -31,6 +32,7 @@
 #include <functional>
 #include <map>
 #include <numeric>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -1037,6 +1039,12 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    std::unique_ptr<llama_expert_streamer> expert_streamer;
+    ggml_context_ptr        moe_stream_ctx;
+    ggml_backend_buffer_ptr moe_stream_buf;
+    std::unordered_map<const ggml_tensor *, llama_moe_stream_mapping> moe_stream_map;
+    int32_t moe_stream_max_tokens = 0;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1667,7 +1675,167 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (params.moe_stream) {
+        init_expert_streaming(ml);
+    }
+
     return true;
+}
+
+void llama_model_base::init_expert_streaming(llama_model_loader & ml) {
+    GGML_ASSERT(ml.stream_exps_pattern != nullptr);
+
+    struct stream_entry {
+        const llama_model_loader::llama_tensor_weight * weight;
+        ggml_tensor * tensor; // the model-owned tensor the graph references; the
+                              // weights_map tensor is loader metadata without data
+        int32_t il;
+    };
+
+    const std::regex pattern(ml.stream_exps_pattern);
+
+    std::unordered_map<std::string, ggml_tensor *> by_name;
+    for (const auto & [tname, t] : tensors_by_name) {
+        by_name.emplace(tname, t);
+    }
+
+    std::vector<stream_entry> entries;
+    std::map<int32_t, int64_t> layer_bytes;
+    for (const auto & [name, weight] : ml.weights_map) {
+        if (!std::regex_search(name, pattern)) {
+            continue;
+        }
+        int32_t il = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+            throw std::runtime_error(format("expert streaming: cannot parse layer from tensor %s", name.c_str()));
+        }
+        const auto it = by_name.find(name);
+        if (it == by_name.end()) {
+            continue;
+        }
+        ggml_tensor * t = it->second;
+        // the pattern also matches per-expert .scale sidecars; only the 3D slab
+        // tensors are streamed, everything else stays resident
+        if (t->ne[2] <= 1) {
+            continue;
+        }
+        GGML_ASSERT(ggml_is_contiguous(t));
+        if (ml.file_paths.at(weight.idx).empty()) {
+            throw std::runtime_error("expert streaming requires models loaded from file paths");
+        }
+        entries.push_back({&weight, t, il});
+        layer_bytes[il] += (int64_t) t->nb[2];
+    }
+
+    if (entries.empty()) {
+        LLAMA_LOG_WARN("%s: --moe-stream requested but the model has no routed expert tensors\n", __func__);
+        return;
+    }
+
+    const int32_t n_expert_used = (int32_t) hparams.n_expert_used;
+    GGML_ASSERT(n_expert_used > 0);
+
+    int32_t n_slots = params.moe_stream_slots;
+    for (const auto & e : entries) {
+        n_slots = std::min<int32_t>(n_slots, (int32_t) e.tensor->ne[2]);
+    }
+    if (n_slots < n_expert_used) {
+        throw std::runtime_error(format("expert streaming: %d slots cannot hold the %d experts used per token", n_slots, n_expert_used));
+    }
+
+    // one token needs n_expert_used slots, so larger ubatches require more slots
+    int32_t max_tokens = std::max(1, params.moe_stream_max_tokens);
+    if (max_tokens > n_slots / n_expert_used) {
+        max_tokens = n_slots / n_expert_used;
+        LLAMA_LOG_WARN("%s: moe_stream_max_tokens clamped to %d to fit %d slots\n", __func__, max_tokens, n_slots);
+    }
+
+    const std::set<int32_t> layer_ids = [&]() {
+        std::set<int32_t> ret;
+        for (const auto & e : entries) {
+            ret.insert(e.il);
+        }
+        return ret;
+    }();
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (entries.size() + layer_ids.size()),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    pimpl->moe_stream_ctx.reset(ggml_init(ip));
+    ggml_context * ctx = pimpl->moe_stream_ctx.get();
+
+    std::map<int32_t, ggml_tensor *> slot_ids_by_layer;
+    for (int32_t il : layer_ids) {
+        ggml_tensor * slot_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, max_tokens);
+        ggml_format_name(slot_ids, "blk.%d.moe_slot_ids", il);
+        slot_ids_by_layer[il] = slot_ids;
+    }
+
+    for (const auto & e : entries) {
+        ggml_tensor * t = e.tensor;
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], n_slots);
+        ggml_format_name(pool, "%s.pool", t->name);
+        pimpl->moe_stream_map[t] = {pool, slot_ids_by_layer.at(e.il), e.il};
+    }
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (const auto & d : devices) {
+        const auto type = ggml_backend_dev_type(d.dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            // on integrated GPUs the pinned host buffer is a zero-copy compute buffer,
+            // so disk reads land directly in memory the GPU kernels address
+            buft = ggml_backend_dev_host_buffer_type(d.dev);
+        } else if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            buft = ggml_backend_dev_buffer_type(d.dev);
+        }
+        if (buft) {
+            break;
+        }
+    }
+    if (!buft) {
+        buft = ggml_backend_cpu_buffer_type();
+    }
+
+    pimpl->moe_stream_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
+    if (!pimpl->moe_stream_buf) {
+        throw std::runtime_error(format("expert streaming: failed to allocate pools in %s buffer", ggml_backend_buft_name(buft)));
+    }
+    ggml_backend_buffer_set_usage(pimpl->moe_stream_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    pimpl->expert_streamer = std::make_unique<llama_expert_streamer>(n_slots, params.moe_stream_io_threads);
+    pimpl->expert_streamer->set_files(ml.file_paths);
+    pimpl->moe_stream_max_tokens = max_tokens;
+
+    for (const auto & e : entries) {
+        ggml_tensor * t = e.tensor;
+        pimpl->expert_streamer->add_tensor(e.il, e.weight->idx, e.weight->offs, t->nb[2], (int32_t) t->ne[2], pimpl->moe_stream_map.at(t).pool);
+    }
+
+    // the snapshotted offsets must address the same bytes the loader placed in the
+    // tensors; compare a slab head per tensor through an independent read path
+    for (const auto & e : entries) {
+        ggml_tensor * t = e.tensor;
+        if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+            continue;
+        }
+        const size_t n_check = std::min<size_t>(4096, t->nb[2]);
+        std::vector<uint8_t> buf(n_check);
+        auto & file = ml.files.at(e.weight->idx);
+        file->seek(e.weight->offs, SEEK_SET);
+        file->read_raw(buf.data(), n_check);
+        if (memcmp(buf.data(), t->data, n_check) != 0) {
+            throw std::runtime_error(format("expert streaming: file offset mismatch for tensor %s", t->name));
+        }
+    }
+
+    int64_t total_bytes = 0;
+    for (const auto & [il, bytes] : layer_bytes) {
+        total_bytes += bytes * n_slots;
+    }
+    LLAMA_LOG_INFO("%s: streaming %zu expert tensors over %zu layers, %d slots/layer, pool = %.2f MiB\n",
+            __func__, entries.size(), layer_ids.size(), n_slots, total_bytes / 1024.0 / 1024.0);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -2021,6 +2189,19 @@ bool llama_model::has_tensor_overrides() const {
 
 bool llama_model::moe_stream() const {
     return params.moe_stream;
+}
+
+llama_expert_streamer * llama_model::expert_streamer() const {
+    return pimpl->expert_streamer.get();
+}
+
+const llama_moe_stream_mapping * llama_model::moe_stream_mapping(const ggml_tensor * w) const {
+    const auto it = pimpl->moe_stream_map.find(w);
+    return it == pimpl->moe_stream_map.end() ? nullptr : &it->second;
+}
+
+int32_t llama_model::moe_stream_max_tokens() const {
+    return pimpl->moe_stream_max_tokens;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

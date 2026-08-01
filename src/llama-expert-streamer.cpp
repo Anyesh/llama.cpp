@@ -237,7 +237,11 @@ void llama_expert_streamer::set_files(const std::vector<std::string> & paths) {
     GGML_ASSERT(pimpl->files.empty());
     pimpl->files.resize(paths.size());
     for (size_t i = 0; i < paths.size(); i++) {
-        pimpl->files[i].open(paths[i]);
+        // empty entries come from FILE-handle loads; they only fail if a streamed
+        // tensor actually references that file index
+        if (!paths[i].empty()) {
+            pimpl->files[i].open(paths[i]);
+        }
     }
 }
 

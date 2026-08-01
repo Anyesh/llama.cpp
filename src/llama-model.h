@@ -17,6 +17,15 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_expert_streamer;
+
+// links a streamed expert weight tensor to its resident pool and the slot-id
+// tensor that the decode graph indexes it with
+struct llama_moe_stream_mapping {
+    ggml_tensor * pool;
+    ggml_tensor * slot_ids;
+    int32_t       il;
+};
 
 // available models
 enum llm_type {
@@ -677,6 +686,13 @@ struct llama_model {
 
     bool moe_stream() const;
 
+    llama_expert_streamer * expert_streamer() const;
+
+    // pool mapping for a streamed expert weight tensor, or nullptr if the tensor is not streamed
+    const llama_moe_stream_mapping * moe_stream_mapping(const ggml_tensor * w) const;
+
+    int32_t moe_stream_max_tokens() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
@@ -743,6 +759,10 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // must run while the loader is alive: snapshots expert slab file offsets and
+    // allocates the resident pools that streamed decode reads from
+    void init_expert_streaming(llama_model_loader & ml);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;
