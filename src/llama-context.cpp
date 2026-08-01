@@ -482,6 +482,16 @@ llama_context::~llama_context() {
     synchronize();
 
     if (model.expert_streamer()) {
+        if (getenv("LLAMA_MOE_STREAM_STATS")) {
+            const auto st = model.expert_streamer()->get_stats();
+            const uint64_t total = st.n_hits + st.n_misses;
+            LLAMA_LOG_INFO("%s: moe stream: %llu hits, %llu misses (%.1f%% hit rate), %.2f MiB read, plan %.1f ms, read %.1f ms, wait %.1f ms\n",
+                    __func__,
+                    (unsigned long long) st.n_hits, (unsigned long long) st.n_misses,
+                    total ? 100.0 * st.n_hits / total : 0.0,
+                    st.n_bytes / 1024.0 / 1024.0,
+                    st.t_plan_us / 1000.0, st.t_read_us / 1000.0, st.t_wait_us / 1000.0);
+        }
         model.moe_stream_unbind();
     }
 

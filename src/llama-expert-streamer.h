@@ -16,7 +16,8 @@ struct llama_expert_streamer_stats {
     uint64_t n_misses    = 0;
     uint64_t n_bytes     = 0;
     uint64_t t_plan_us   = 0;
-    uint64_t t_read_us   = 0;
+    uint64_t t_read_us   = 0; // wall time of synchronous execute() calls
+    uint64_t t_wait_us   = 0; // wall time spent in join() after async dispatch
 };
 
 struct llama_expert_streamer {
@@ -49,6 +50,12 @@ struct llama_expert_streamer {
     // read the missed expert slabs into their slots for every pool of layer il;
     // blocks until all reads (and uploads, for non-host pools) are complete
     void execute(int32_t il, const std::vector<miss> & misses);
+
+    // async variant: dispatch() starts the reads and pins the slots so a
+    // concurrent plan() cannot evict them; join() must run before the layer's
+    // pools are consumed
+    void dispatch(int32_t il, const std::vector<miss> & misses);
+    void join(int32_t il);
 
     llama_expert_streamer_stats get_stats() const;
     void reset_stats();

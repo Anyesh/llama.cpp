@@ -89,15 +89,6 @@ struct stream_file {
     }
 };
 
-struct io_task {
-    const stream_file * file;
-    size_t offs;
-    size_t size;
-    ggml_tensor * pool;
-    size_t pool_offs;
-    bool host;
-};
-
 } // namespace
 
 struct llama_expert_streamer::impl {
@@ -107,6 +98,7 @@ struct llama_expert_streamer::impl {
         uint64_t last_use  = 0;
         uint64_t round     = 0; // plan() call that last assigned or hit this slot; slots
                                 // touched in the current round must not be evicted by it
+        bool     in_flight = false;
     };
 
     struct tensor_entry {
@@ -120,8 +112,20 @@ struct llama_expert_streamer::impl {
     struct layer_state {
         std::vector<slot_info>    slots;
         std::vector<tensor_entry> tensors;
+        std::vector<int32_t>      in_flight_slots;
+        size_t   n_pending = 0; // guarded by q_mtx
         uint64_t tick  = 0;
         uint64_t round = 0;
+    };
+
+    struct io_task {
+        const stream_file * file;
+        size_t offs;
+        size_t size;
+        ggml_tensor * pool;
+        size_t pool_offs;
+        bool host;
+        layer_state * layer;
     };
 
     int32_t n_slots;
@@ -133,14 +137,12 @@ struct llama_expert_streamer::impl {
 
     llama_expert_streamer_stats stats;
 
-    // IO thread pool
     std::vector<std::thread>  workers;
     std::deque<io_task>       queue;
     std::mutex                q_mtx;
     std::condition_variable   q_cv;
     std::condition_variable   done_cv;
-    size_t                    n_pending = 0;
-    bool                      stop      = false;
+    bool                      stop = false;
     std::atomic<bool>         io_error{false};
 
     impl(int32_t n_slots, int32_t n_io_threads) : n_slots(n_slots), n_io_threads(std::max(1, n_io_threads)) {
@@ -196,29 +198,76 @@ struct llama_expert_streamer::impl {
             }
             {
                 std::lock_guard<std::mutex> lock(q_mtx);
-                n_pending--;
-                if (n_pending == 0) {
+                task.layer->n_pending--;
+                if (task.layer->n_pending == 0) {
                     done_cv.notify_all();
                 }
             }
         }
     }
 
-    void submit_and_wait(std::vector<io_task> & tasks) {
+    void dispatch_tasks(int32_t il, const std::vector<miss> & misses) {
+        std::vector<io_task> tasks;
+        layer_state * layer = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+
+            auto it = layers.find(il);
+            GGML_ASSERT(it != layers.end());
+            layer = &it->second;
+
+            tasks.reserve(misses.size() * layer->tensors.size());
+            for (const auto & m : misses) {
+                layer->slots[m.slot].in_flight = true;
+                layer->in_flight_slots.push_back(m.slot);
+                for (const auto & t : layer->tensors) {
+                    GGML_ASSERT(m.expert_id >= 0 && m.expert_id < t.n_expert);
+                    GGML_ASSERT(t.file_idx < files.size());
+                    const bool host = t.pool->buffer == nullptr || ggml_backend_buffer_is_host(t.pool->buffer);
+                    tasks.push_back({
+                        &files[t.file_idx],
+                        t.offs + (size_t) m.expert_id * t.slab_nbytes,
+                        t.slab_nbytes,
+                        t.pool,
+                        (size_t) m.slot * t.slab_nbytes,
+                        host,
+                        layer,
+                    });
+                    stats.n_bytes += t.slab_nbytes;
+                }
+            }
+        }
         if (tasks.empty()) {
             return;
         }
         {
             std::lock_guard<std::mutex> lock(q_mtx);
-            n_pending += tasks.size();
+            layer->n_pending += tasks.size();
             for (auto & t : tasks) {
                 queue.push_back(t);
             }
         }
         q_cv.notify_all();
+    }
+
+    void join_layer(int32_t il) {
+        layer_state * layer = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = layers.find(il);
+            GGML_ASSERT(it != layers.end());
+            layer = &it->second;
+        }
         {
             std::unique_lock<std::mutex> lock(q_mtx);
-            done_cv.wait(lock, [this]() { return n_pending == 0; });
+            done_cv.wait(lock, [layer]() { return layer->n_pending == 0; });
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (int32_t s : layer->in_flight_slots) {
+                layer->slots[s].in_flight = false;
+            }
+            layer->in_flight_slots.clear();
         }
         if (io_error.load()) {
             io_error.store(false);
@@ -289,11 +338,12 @@ void llama_expert_streamer::plan(int32_t il, const int32_t * ids, int32_t n, std
                 pimpl->stats.n_hits++;
             }
         } else {
-            // LFU victim, LRU tie-break; slots already claimed this round are excluded
+            // LFU victim, LRU tie-break; slots claimed this round or still being
+            // filled by in-flight reads are excluded
             int32_t victim = -1;
             for (int32_t s = 0; s < pimpl->n_slots; s++) {
                 const auto & si = layer.slots[s];
-                if (si.round == layer.round) {
+                if (si.round == layer.round || si.in_flight) {
                     continue;
                 }
                 if (si.expert_id < 0) {
@@ -328,44 +378,29 @@ void llama_expert_streamer::execute(int32_t il, const std::vector<miss> & misses
     if (misses.empty()) {
         return;
     }
-
     const auto t_start = std::chrono::steady_clock::now();
 
-    std::vector<io_task> tasks;
-    uint64_t n_bytes = 0;
-    {
-        std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->dispatch_tasks(il, misses);
+    pimpl->join_layer(il);
 
-        auto it = pimpl->layers.find(il);
-        GGML_ASSERT(it != pimpl->layers.end());
-        const auto & layer = it->second;
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->stats.t_read_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start).count();
+}
 
-        tasks.reserve(misses.size() * layer.tensors.size());
-        for (const auto & m : misses) {
-            for (const auto & t : layer.tensors) {
-                GGML_ASSERT(m.expert_id >= 0 && m.expert_id < t.n_expert);
-                GGML_ASSERT(t.file_idx < pimpl->files.size());
-                const bool host = t.pool->buffer == nullptr || ggml_backend_buffer_is_host(t.pool->buffer);
-                tasks.push_back({
-                    &pimpl->files[t.file_idx],
-                    t.offs + (size_t) m.expert_id * t.slab_nbytes,
-                    t.slab_nbytes,
-                    t.pool,
-                    (size_t) m.slot * t.slab_nbytes,
-                    host,
-                });
-                n_bytes += t.slab_nbytes;
-            }
-        }
+void llama_expert_streamer::dispatch(int32_t il, const std::vector<miss> & misses) {
+    if (misses.empty()) {
+        return;
     }
+    pimpl->dispatch_tasks(il, misses);
+}
 
-    pimpl->submit_and_wait(tasks);
+void llama_expert_streamer::join(int32_t il) {
+    const auto t_start = std::chrono::steady_clock::now();
 
-    {
-        std::lock_guard<std::mutex> lock(pimpl->mtx);
-        pimpl->stats.n_bytes   += n_bytes;
-        pimpl->stats.t_read_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start).count();
-    }
+    pimpl->join_layer(il);
+
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->stats.t_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start).count();
 }
 
 llama_expert_streamer_stats llama_expert_streamer::get_stats() const {
