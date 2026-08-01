@@ -2528,6 +2528,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-stream"},
+        "stream Mixture of Experts (MoE) weights from disk during decode, keeping only small per-layer expert pools resident",
+        [](common_params & params) {
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-slots"}, "N",
+        string_format("number of expert slots per MoE layer for --moe-stream (default: %d)", params.moe_stream_slots),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-stream-io-threads"}, "N",
+        string_format("number of parallel read threads for --moe-stream (default: %d)", params.moe_stream_io_threads),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

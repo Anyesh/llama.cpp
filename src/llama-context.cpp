@@ -1318,6 +1318,34 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::graph_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
+    auto * ctx = (llama_context *) user_data;
+
+    if (ask) {
+        bool need = ctx->moe_stream_eval(t, true);
+        if (ctx->cparams.cb_eval) {
+            need = ctx->cparams.cb_eval(t, true, ctx->cparams.cb_eval_user_data) || need;
+        }
+        return need;
+    }
+
+    // the sched does not record which consumer asked for a node, so each ask
+    // predicate is re-evaluated here to route the need phase
+    if (ctx->moe_stream_eval(t, true) && !ctx->moe_stream_eval(t, false)) {
+        return false;
+    }
+    if (ctx->cparams.cb_eval && ctx->cparams.cb_eval(t, true, ctx->cparams.cb_eval_user_data)) {
+        return ctx->cparams.cb_eval(t, false, ctx->cparams.cb_eval_user_data);
+    }
+    return true;
+}
+
+bool llama_context::moe_stream_eval(ggml_tensor * t, bool ask) {
+    GGML_UNUSED(t);
+    GGML_UNUSED(ask);
+    return false;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1347,7 +1375,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (model.moe_stream()) {
+            ggml_backend_sched_set_eval_callback(sched.get(), graph_eval_callback, this);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 

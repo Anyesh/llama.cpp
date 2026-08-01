@@ -1161,8 +1161,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
 
+        if (stream_exps_pattern) {
+            const std::string tensor_name = tn.str();
+            const std::regex pattern(stream_exps_pattern);
+            if (std::regex_search(tensor_name, pattern)) {
+                // must stay mmap-backed: an extra (repacked) buffer type would
+                // materialize the full expert set in RAM
+                buft = ggml_backend_cpu_buffer_type();
+            }
+        }
+
         // check overrides
-        if (tensor_buft_overrides) {
+        if (!buft && tensor_buft_overrides) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
