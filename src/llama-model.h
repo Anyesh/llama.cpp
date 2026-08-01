@@ -695,9 +695,16 @@ struct llama_model {
 
     int32_t moe_stream_max_tokens() const;
 
+    // true when the arch orders top-k before the shared-expert branch, letting the
+    // eval callback overlap expert disk reads with shared-FFN compute
+    bool moe_stream_overlap() const;
+
     // the slot cache holds one expert set; only one context may stream at a time
     bool moe_stream_bind() const;
     void moe_stream_unbind() const;
+
+    // debug: compare a loaded pool slab against the mmap-backed original tensor
+    bool moe_stream_verify_slab(int32_t il, int32_t expert_id, int32_t slot) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
