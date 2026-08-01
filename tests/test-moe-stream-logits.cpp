@@ -6,6 +6,8 @@
 
 #include "llama.h"
 
+#include "ggml-backend.h"
+
 #include "get-model.h"
 
 #include <cmath>
@@ -27,6 +29,17 @@ static run_state make_run(const char * model_path, bool stream, int32_t slots) {
     // repacked extra buffer types would give the baseline different kernels than
     // the plain-CPU tensors streaming requires; identity needs identical kernels
     mparams.use_extra_bufts  = false;
+
+    // the baseline must keep experts on the CPU like --cpu-moe, or a GPU machine
+    // whose VRAM cannot hold the full expert set fails to load it
+    static llama_model_tensor_buft_override cpu_moe_overrides[] = {
+        { "\\.ffn_(up|down|gate|gate_up)_(ch|)exps", nullptr },
+        { nullptr,                                   nullptr },
+    };
+    if (!stream) {
+        cpu_moe_overrides[0].buft = ggml_backend_cpu_buffer_type();
+        mparams.tensor_buft_overrides = cpu_moe_overrides;
+    }
 
     run_state r;
     r.model = llama_model_load_from_file(model_path, mparams);
