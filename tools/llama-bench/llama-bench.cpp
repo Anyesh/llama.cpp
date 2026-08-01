@@ -407,6 +407,12 @@ static const cmd_params cmd_params_defaults = {
     /* output_format_stderr */ NONE,
 };
 
+// applied to every instance rather than joining the test matrix; sweep them by
+// invoking llama-bench once per configuration
+static bool moe_stream            = false;
+static int  moe_stream_slots      = 16;
+static int  moe_stream_io_threads = 4;
+
 static void print_usage(int /* argc */, char ** argv) {
     printf("usage: %s [options]\n", argv[0]);
     printf("\n");
@@ -468,6 +474,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --moe-stream <0|1>                                (default: 0)\n");
+    printf("  --moe-stream-slots <n>                            (default: 16)\n");
+    printf("  --moe-stream-io-threads <n>                       (default: 4)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -898,6 +907,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--moe-stream") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                moe_stream = std::stoi(argv[i]) != 0;
+            } else if (arg == "--moe-stream-slots") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                moe_stream_slots = std::stoi(argv[i]);
+            } else if (arg == "--moe-stream-io-threads") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                moe_stream_io_threads = std::stoi(argv[i]);
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1225,6 +1252,10 @@ struct cmd_params_instance {
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
+
+        mparams.moe_stream            = moe_stream;
+        mparams.moe_stream_slots      = moe_stream_slots;
+        mparams.moe_stream_io_threads = moe_stream_io_threads;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
