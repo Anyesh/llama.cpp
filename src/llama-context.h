@@ -262,6 +262,11 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // sched eval callback that drives expert streaming and chains any user callback
+    static bool graph_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
+
+    bool moe_stream_eval(struct ggml_tensor * t, bool ask);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);

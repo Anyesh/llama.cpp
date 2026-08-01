@@ -331,6 +331,12 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // SSD expert streaming: keep MoE expert weights on disk and stream the slabs
+        // selected by the router into small per-layer pools during decode
+        int32_t moe_stream_slots;      // expert slots per MoE layer
+        int32_t moe_stream_io_threads; // parallel read threads
+        int32_t moe_stream_max_tokens; // max ubatch size routed through the pools
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -338,6 +344,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool moe_stream;      // enable SSD expert streaming for MoE decode
     };
 
     struct llama_sampler_seq_config {

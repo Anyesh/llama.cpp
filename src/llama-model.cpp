@@ -1046,7 +1046,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
-    pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    pimpl->has_tensor_overrides = (params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern) || params.moe_stream;
 }
 
 llama_model::~llama_model() {
@@ -1261,6 +1261,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+
+    if (params.moe_stream) {
+        ml.stream_exps_pattern = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+    }
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, llama_load_mode_name(params.load_mode));
@@ -1526,7 +1530,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // with expert streaming the mappings must not be prefetched: MAP_POPULATE on the
+    // full expert pool would thrash a machine whose RAM is smaller than the model
+    ml.init_mappings(!params.moe_stream, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2013,6 +2019,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::moe_stream() const {
+    return params.moe_stream;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2385,12 +2395,16 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_stream_slots            =*/ 16,
+        /*.moe_stream_io_threads       =*/ 4,
+        /*.moe_stream_max_tokens       =*/ 1,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_stream                  =*/ false,
     };
 
     return result;

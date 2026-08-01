@@ -524,6 +524,10 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    bool    moe_stream            = false; // stream MoE expert weights from disk during decode
+    int32_t moe_stream_slots      = 16;    // expert slots per MoE layer
+    int32_t moe_stream_io_threads = 4;     // parallel read threads for expert streaming
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
