@@ -1936,7 +1936,12 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
     const auto & yarn_beta_fast   = cparams.yarn_beta_fast;
     const auto & yarn_beta_slow   = cparams.yarn_beta_slow;
-    const auto & yarn_attn_factor = cparams.yarn_attn_factor;
+    // A shift is a pure rotation of K that is already stored rotated (and, for YaRN, magnitude
+    // scaled) once at write time. With yarn_ext_factor != 0 the rope kernel multiplies cos/sin by
+    // mscale = 1 + 0.1*ln(1/freq_scale) again, so every shift would rescale K by mscale. Cancel it.
+    const float yarn_attn_factor = yarn_ext_factor != 0.0f
+        ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
+        : 1.0f;
 
     const auto & n_rot     = hparams.n_rot(il);
     const auto & rope_type = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
