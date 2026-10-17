@@ -17,9 +17,12 @@ set(HTP_LIB ggml-htp-${DSP_VERSION})
 add_library(${HTP_LIB} SHARED
     main.c
     htp_iface_skel.c
-    worker-pool.c
-    hex-dma.c
+    work-queue.c
+    dma-queue.c
     hmx-queue.c
+    htp-dcache.c
+    matmul-ops.c
+    flash-attn-ops.c
     gated-delta-net-ops.c
     binary-ops.c
     unary-ops.c
@@ -30,8 +33,8 @@ add_library(${HTP_LIB} SHARED
     set-rows-ops.c
     get-rows-ops.c
     cpy-ops.c
+    gather-rows.c
     repeat-ops.c
-    argsort-ops.c
     ssm-conv.c
     cumsum-ops.c
     fill-ops.c
@@ -39,8 +42,11 @@ add_library(${HTP_LIB} SHARED
     diag-ops.c
     solve-tri-ops.c
     pad-ops.c
-    flash-attn-ops.c
-    matmul-ops.c
+    argsort-ops.c
+    im2col-ops.c
+    roll-ops.c
+    pool-ops.c
+    allreduce-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE
