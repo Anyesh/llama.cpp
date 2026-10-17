@@ -3053,6 +3053,12 @@ bool llama_kv_cache::block_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     // read the per-cell metadata (original positions) without mutating the cache yet
     std::vector<llama_pos> pos_org(cell_count);
 
+    // must mirror state_write_meta, which writes ext whenever has_cell_ext() (M-RoPE and PLE)
+    std::vector<llama_kv_cell_ext> exts;
+    if (has_cell_ext()) {
+        exts.resize(cell_count);
+    }
+
     for (uint32_t i = 0; i < cell_count; ++i) {
         llama_pos pos;
         uint32_t  n_seq_id;
@@ -3065,9 +3071,8 @@ bool llama_kv_cache::block_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             return false;
         }
 
-        if (hparams.n_pos_per_embd() > 1) {
-            llama_kv_cell_ext ext;
-            io.read(&ext, sizeof(ext));
+        if (has_cell_ext()) {
+            io.read(&exts[i], sizeof(exts[i]));
         }
 
         // the stored seq id is discarded - the block is restored into seq_id
@@ -3114,6 +3119,10 @@ bool llama_kv_cache::block_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
         cells.pos_set(idx, pos_org[i]);
         cells.seq_add(idx, seq_id);
+
+        if (!exts.empty()) {
+            cells.ext_set(idx, exts[i]);
+        }
     }
 
     // load the K/V tensor data into the found cells (handles GQA, v_trans and quantized K)
